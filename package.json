@@ -1,0 +1,20 @@
+{
+  "name": "mmbot-server",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "API server for MMBot - GCBEX trading bot",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "mongodb": "^6.3.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.11"
+  }
+}
