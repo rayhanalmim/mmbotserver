@@ -51,9 +51,13 @@ async function connectToMongoDB() {
     process.exit(1);
   }
 }
-
 // Middleware
-app.use(cors());
+app.use(cors({
+  origin: "https://bot.gcbtoken.io",
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: true
+}));
 app.use(express.json());
 
 // Rate limiting removed for better performance

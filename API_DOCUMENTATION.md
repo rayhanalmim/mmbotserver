@@ -1,6 +1,6 @@
 # MMBot API Documentation
 
-Base URL: `https://mmbotservergcb.vercel.app`
+Base URL: `https://api.gcbtoken.io`
 
 ## Authentication
 
@@ -329,7 +329,7 @@ WebSocket messages should include the `uaTime` parameter in the format: `YYYY-MM
 ```javascript
 // Get market rates
 const getRates = async () => {
-  const response = await fetch('https://mmbotservergcb.vercel.app/api/market/rates', {
+  const response = await fetch('https://api.gcbtoken.io/api/market/rates', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -342,7 +342,7 @@ const getRates = async () => {
 
 // Get user balance
 const getBalance = async (token) => {
-  const response = await fetch('https://mmbotservergcb.vercel.app/api/users/balance', {
+  const response = await fetch('https://api.gcbtoken.io/api/users/balance', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -359,12 +359,12 @@ const getBalance = async (token) => {
 
 ```bash
 # Get market rates
-curl -X POST https://mmbotservergcb.vercel.app/api/market/rates \
+curl -X POST https://api.gcbtoken.io/api/market/rates \
   -H "Content-Type: application/json" \
   -d '{"fiat":"USD"}'
 
 # Get user balance
-curl -X POST https://mmbotservergcb.vercel.app/api/users/balance \
+curl -X POST https://api.gcbtoken.io/api/users/balance \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer YOUR_TOKEN" \
   -d '{"accountType":1}'
