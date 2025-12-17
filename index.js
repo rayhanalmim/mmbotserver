@@ -7,6 +7,7 @@ import BotMonitor from './bot-monitor.js';
 import ScheduledBotMonitor from './scheduled-bot-monitor.js';
 import MarketMakerBotMonitor from './market-maker-bot-monitor.js';
 import StabilizerBotMonitor from './stabilizer-bot-monitor.js';
+import telegramService from './telegram-service.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -24,6 +25,10 @@ console.log(`WEB_API_BASE: ${GCBEX_API_BASE}`);
 console.log(`API_KEY: ${GCBEX_API_KEY ? GCBEX_API_KEY.substring(0, 10) + '...' : '❌ NOT FOUND'}`);
 console.log(`API_SECRET: ${GCBEX_API_SECRET ? GCBEX_API_SECRET.substring(0, 10) + '...' : '❌ NOT FOUND'}`);
 console.log('✅ Market Data: Using Open API (no rate limits)');
+console.log(`\n📱 Telegram Configuration:`);
+console.log(`BOT_TOKEN: ${process.env.TELEGRAM_BOT_TOKEN ? process.env.TELEGRAM_BOT_TOKEN.substring(0, 10) + '...' : '❌ NOT CONFIGURED'}`);
+console.log(`CHAT_ID: ${process.env.TELEGRAM_CHAT_ID ? process.env.TELEGRAM_CHAT_ID : '❌ NOT CONFIGURED'}`);
+console.log(`Status: ${telegramService.isConfigured() ? '✅ CONFIGURED' : '⚠️ NOT CONFIGURED'}`);
 console.log('');
 
 // MongoDB connection
@@ -53,7 +58,7 @@ async function connectToMongoDB() {
 }
 // Middleware
 app.use(cors({
-  origin: "https://bot.gcbtoken.io",
+  origin: ["https://bot.gcbtoken.io", "http://localhost:3000"],
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
   credentials: true
@@ -72,6 +77,34 @@ function getUaTime() {
   const minutes = String(now.getMinutes()).padStart(2, '0');
   const seconds = String(now.getSeconds()).padStart(2, '0');
   return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+}
+
+// Helper: Get user's stored API credentials from database
+async function getUserApiCredentials(token) {
+  if (!db) {
+    throw new Error('Database not connected');
+  }
+  
+  const user = await db.collection('users').findOne({ token });
+  if (!user || !user.apiKey || !user.apiSecret) {
+    return null;
+  }
+  
+  return {
+    apiKey: user.apiKey,
+    apiSecret: user.apiSecret,
+    uid: user.uid
+  };
+}
+
+// Helper: Generate Open API signature with user's credentials
+function generateUserSignature(apiSecret, timestamp, method, requestPath, bodyJson = '') {
+  const message = `${timestamp}${method.toUpperCase()}${requestPath}${bodyJson}`;
+  const signature = crypto
+    .createHmac('sha256', apiSecret)
+    .update(message)
+    .digest('hex');
+  return signature;
 }
 
 // ============================================
@@ -187,6 +220,220 @@ app.get('/api/health', (req, res) => {
 
 app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'mmbot-api', database: db ? 'connected' : 'disconnected' });
+});
+
+// ============================================
+// Telegram Notification Endpoints
+// ============================================
+
+// GET /api/telegram/test - Test Telegram notification
+app.get('/api/telegram/test', async (req, res) => {
+  try {
+    if (!telegramService.isConfigured()) {
+      return res.status(400).json({
+        code: '-1',
+        msg: 'Telegram not configured. Please add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to your .env file',
+        data: null
+      });
+    }
+
+    const result = await telegramService.sendTestNotification();
+
+    if (result.success) {
+      return res.json({
+        code: '0',
+        msg: 'Test notification sent successfully',
+        data: result.data
+      });
+    } else {
+      return res.status(500).json({
+        code: '-1',
+        msg: 'Failed to send test notification',
+        error: result.error,
+        data: null
+      });
+    }
+  } catch (error) {
+    console.error('Error testing Telegram:', error);
+    return res.status(500).json({
+      code: '-1',
+      msg: 'Error occurred while testing Telegram',
+      error: error.message,
+      data: null
+    });
+  }
+});
+
+// GET /api/telegram/status - Check Telegram configuration status
+app.get('/api/telegram/status', (req, res) => {
+  try {
+    const isConfigured = telegramService.isConfigured();
+    
+    return res.json({
+      code: '0',
+      msg: 'Success',
+      data: {
+        configured: isConfigured,
+        botToken: process.env.TELEGRAM_BOT_TOKEN ? 
+          `${process.env.TELEGRAM_BOT_TOKEN.substring(0, 10)}...` : 
+          null,
+        chatId: process.env.TELEGRAM_CHAT_ID || null
+      }
+    });
+  } catch (error) {
+    console.error('Error checking Telegram status:', error);
+    return res.status(500).json({
+      code: '-1',
+      msg: 'Error occurred while checking Telegram status',
+      error: error.message,
+      data: null
+    });
+  }
+});
+
+// POST /api/telegram/test-stabilizer - Test stabilizer bot notification with small order
+app.post('/api/telegram/test-stabilizer', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ code: '-1', msg: 'Unauthorized', data: null });
+    }
+
+    const token = authHeader.split(' ')[1];
+    const user = await db.collection('users').findOne({ token });
+    
+    if (!user) {
+      return res.status(401).json({ code: '-1', msg: 'Invalid token', data: null });
+    }
+
+    // Check if user has API credentials
+    if (!user.apiKey || !user.apiSecret) {
+      return res.status(400).json({ 
+        code: '-1', 
+        msg: 'API credentials not configured. Please add your API credentials first.', 
+        data: null 
+      });
+    }
+
+    // Check Telegram configuration
+    if (!telegramService.isConfigured()) {
+      return res.status(400).json({
+        code: '-1',
+        msg: 'Telegram not configured. Please add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to your .env file',
+        data: null
+      });
+    }
+
+    console.log('🧪 Testing Stabilizer Bot notification with $0.50 USDT order...');
+
+    // Get current market price
+    const marketPriceResponse = await fetch(`${GCBEX_OPEN_API_BASE}/sapi/v2/ticker?symbol=gcbusdt`);
+    const marketPriceData = await marketPriceResponse.json();
+    const marketPrice = parseFloat(marketPriceData.last);
+
+    console.log(`📊 Current market price: $${marketPrice}`);
+
+    // Place a small market buy order with $0.50 USDT
+    const testAmount = 0.50; // $0.50 USDT
+    const orderBody = {
+      symbol: 'GCBUSDT',
+      side: 'BUY',
+      type: 'MARKET',
+      volume: testAmount.toFixed(2)
+    };
+
+    // Get server time and create signature
+    const timestamp = (await getServerTime()).toString();
+    const method = 'POST';
+    const requestPath = '/sapi/v2/order';
+    const bodyJson = JSON.stringify(orderBody, null, 0).replace(/\s/g, '');
+    const message = `${timestamp}${method.toUpperCase()}${requestPath}${bodyJson}`;
+    const signature = crypto
+      .createHmac('sha256', user.apiSecret)
+      .update(message)
+      .digest('hex');
+
+    console.log(`💱 Placing test order: BUY $${testAmount} USDT worth of GCB`);
+
+    // Execute test order
+    const response = await fetch(`${GCBEX_OPEN_API_BASE}${requestPath}`, {
+      method: 'POST',
+      headers: {
+        'X-CH-APIKEY': user.apiKey,
+        'X-CH-TS': timestamp,
+        'X-CH-SIGN': signature,
+        'Content-Type': 'application/json'
+      },
+      body: bodyJson
+    });
+
+    const result = await response.json();
+
+    if (result.orderId) {
+      console.log(`✅ Test order placed successfully! Order ID: ${result.orderId}`);
+
+      // Send Telegram notification using stabilizer bot format
+      const notificationResult = await telegramService.notifyStabilizerBotOrder({
+        botName: 'Stabilizer Bot (TEST)',
+        symbol: 'GCBUSDT',
+        orderNumber: 1,
+        totalOrders: 1,
+        usdtAmount: testAmount,
+        orderId: result.orderId,
+        marketPrice: marketPrice,
+        targetPrice: marketPrice, // For test, use same price
+        status: 'success'
+      });
+
+      if (notificationResult.success) {
+        console.log('✅ Telegram notification sent successfully!');
+      } else {
+        console.error('❌ Failed to send Telegram notification:', notificationResult.error);
+      }
+
+      return res.json({
+        code: '0',
+        msg: 'Test order placed and notification sent successfully',
+        data: {
+          orderId: result.orderId,
+          usdtAmount: testAmount,
+          marketPrice: marketPrice,
+          telegramSent: notificationResult.success,
+          orderResult: result
+        }
+      });
+    } else {
+      console.error('❌ Test order failed:', result.msg || 'Unknown error');
+      
+      // Send failed notification
+      await telegramService.notifyStabilizerBotOrder({
+        botName: 'Stabilizer Bot (TEST)',
+        symbol: 'GCBUSDT',
+        orderNumber: 1,
+        totalOrders: 1,
+        usdtAmount: testAmount,
+        marketPrice: marketPrice,
+        targetPrice: marketPrice,
+        status: 'failed',
+        error: result.msg || 'Unknown error'
+      });
+
+      return res.status(400).json({
+        code: '-1',
+        msg: 'Test order failed',
+        error: result.msg || 'Unknown error',
+        data: result
+      });
+    }
+  } catch (error) {
+    console.error('❌ Error in test-stabilizer endpoint:', error);
+    return res.status(500).json({
+      code: '-1',
+      msg: 'Error occurred while testing stabilizer bot',
+      error: error.message,
+      data: null
+    });
+  }
 });
 
 // ============================================
@@ -606,7 +853,7 @@ app.post('/api/users/info', async (req, res) => {
   }
 });
 
-// POST /api/users/balance - Get account balance from GCBEX
+// POST /api/users/balance - Get account balance using Open API (no token expiry)
 app.post('/api/users/balance', async (req, res) => {
   try {
     const authHeader = req.headers.authorization;
@@ -615,30 +862,57 @@ app.post('/api/users/balance', async (req, res) => {
     }
 
     const token = authHeader.split(' ')[1];
-    const { accountType = 'EXCHANGE' } = req.body; // 1 = spot, 2 = futures, etc.
+    
+    // Get user's stored API credentials
+    const credentials = await getUserApiCredentials(token);
+    if (!credentials) {
+      return res.status(400).json({ 
+        code: '-1', 
+        msg: 'API credentials not found. Please add your API credentials in settings.', 
+        data: null,
+        needsCredentials: true
+      });
+    }
 
-    const response = await fetch(`${GCBEX_API_BASE}/finance/v5/account_balance`, {
-      method: 'POST',
+    // Use Open API to get balance (no expiry)
+    const timestamp = Date.now().toString();
+    const method = 'GET';
+    const requestPath = '/sapi/v1/account';
+    const signature = generateUserSignature(credentials.apiSecret, timestamp, method, requestPath);
+
+    const response = await fetch(`${GCBEX_OPEN_API_BASE}${requestPath}`, {
+      method: 'GET',
       headers: {
-        'Content-Type': 'application/json',
-        'exchange-token': token,
+        'X-CH-APIKEY': credentials.apiKey,
+        'X-CH-TS': timestamp,
+        'X-CH-SIGN': signature,
       },
-      body: JSON.stringify({
-        accountType,
-        uaTime: getUaTime(),
-      }),
     });
 
     const data = await response.json();
-    res.json(data);
-  } catch (error) {
-    // Only log first occurrence to reduce noise (likely rate limiting from GCBEX)
-    if (!global.balanceErrorLogged) {
-      console.warn('⚠️ Balance temporarily unavailable (GCBEX rate limit or network issue)');
-      global.balanceErrorLogged = true;
-      setTimeout(() => { global.balanceErrorLogged = false; }, 60000); // Reset after 1 minute
+    
+    // Transform Open API response to match old format
+    if (data.balances) {
+      const allCoinMap = {};
+      data.balances.forEach(balance => {
+        allCoinMap[balance.asset] = {
+          coinName: balance.asset,
+          free: balance.free,
+          locked: balance.locked,
+          total: (parseFloat(balance.free) + parseFloat(balance.locked)).toString()
+        };
+      });
+      
+      res.json({
+        code: '0',
+        msg: 'success',
+        data: { allCoinMap }
+      });
+    } else {
+      res.json(data);
     }
-    // Return empty balance instead of crashing
+  } catch (error) {
+    console.error('Error fetching balance:', error.message);
     res.status(200).json({ 
       code: '-1', 
       msg: 'Balance temporarily unavailable', 
@@ -837,12 +1111,6 @@ async function getServerTime() {
     console.log('⚠️ Failed to fetch server time, using local time');
     return Date.now();
   }
-}
-
-// Helper function to generate HMAC signature with user's API secret
-function generateUserSignature(timestamp, method, requestPath, bodyJson, apiSecret) {
-  const message = `${timestamp}${method.toUpperCase()}${requestPath}${bodyJson}`;
-  return crypto.createHmac('sha256', apiSecret).update(message).digest('hex');
 }
 
 // GET /api/trade/open-orders - Get open orders using stored API credentials
@@ -1249,7 +1517,7 @@ app.delete('/api/bot/conditions/:id', async (req, res) => {
 // Bot Control Endpoints
 // ============================================
 
-// POST /api/bot/start - Start the bot monitoring service
+// POST /api/bot/start - Start the bot monitoring service and enable bot for current user
 app.post('/api/bot/start', async (req, res) => {
   try {
     const authHeader = req.headers.authorization;
@@ -1257,23 +1525,74 @@ app.post('/api/bot/start', async (req, res) => {
       return res.status(401).json({ code: '-1', msg: 'Unauthorized', data: null });
     }
 
+    const token = authHeader.split(' ')[1];
+    const user = await db.collection('users').findOne({ token });
+    
+    if (!user) {
+      return res.status(401).json({ code: '-1', msg: 'Invalid token', data: null });
+    }
+
     if (!botMonitor) {
       return res.status(500).json({ code: '-1', msg: 'Bot service not initialized', data: null });
     }
 
-    await botMonitor.start();
-    
-    // Store bot state in database
-    await db.collection('bot_config').updateOne(
-      { _id: 'global' },
-      { $set: { isRunning: true, lastStarted: new Date() } },
-      { upsert: true }
+    // Check if user has API credentials
+    if (!user.apiKey || !user.apiSecret) {
+      return res.status(400).json({
+        code: '-1',
+        msg: 'Please configure your API credentials first before enabling the bot',
+        data: null
+      });
+    }
+
+    // Enable bot for current user
+    await db.collection('users').updateOne(
+      { uid: user.uid },
+      { 
+        $set: { 
+          botEnabled: true,
+          botEnabledAt: new Date().toISOString()
+        } 
+      }
     );
+
+    // Start conditional bot monitor
+    if (!botMonitor.isRunning) {
+      await botMonitor.start();
+      console.log('🤖 Started conditional bot monitor');
+    }
+
+    // Start stabilizer bot monitor if user has active stabilizer bots
+    const userStabilizerBots = await db.collection('stabilizer_bots').countDocuments({
+      userId: user.uid,
+      isActive: true,
+      isRunning: true
+    });
+
+    if (userStabilizerBots > 0 && !stabilizerBotMonitor.isRunning) {
+      await stabilizerBotMonitor.start();
+      console.log('🎯 Started stabilizer bot monitor');
+    }
+
+    // Log activity
+    await db.collection('bot_admin_logs').insertOne({
+      userId: user.uid,
+      action: 'BOT_STARTED',
+      timestamp: new Date(),
+      details: { message: 'User started bot via global start endpoint' }
+    });
+    
+    console.log(`✅ Bot enabled and started for user ${user.uid}`);
     
     res.json({
       code: '0',
       msg: 'Bot monitoring service started successfully',
-      data: botMonitor.getStatus()
+      data: {
+        botEnabled: true,
+        conditionalBotRunning: botMonitor.isRunning,
+        stabilizerBotRunning: stabilizerBotMonitor.isRunning,
+        hasStabilizerBots: userStabilizerBots > 0
+      }
     });
   } catch (error) {
     console.error('Error starting bot:', error);
@@ -1281,7 +1600,7 @@ app.post('/api/bot/start', async (req, res) => {
   }
 });
 
-// POST /api/bot/stop - Stop the bot monitoring service
+// POST /api/bot/stop - Stop the bot monitoring service and disable bot for current user
 app.post('/api/bot/stop', async (req, res) => {
   try {
     const authHeader = req.headers.authorization;
@@ -1289,23 +1608,80 @@ app.post('/api/bot/stop', async (req, res) => {
       return res.status(401).json({ code: '-1', msg: 'Unauthorized', data: null });
     }
 
+    const token = authHeader.split(' ')[1];
+    const user = await db.collection('users').findOne({ token });
+    
+    if (!user) {
+      return res.status(401).json({ code: '-1', msg: 'Invalid token', data: null });
+    }
+
     if (!botMonitor) {
       return res.status(500).json({ code: '-1', msg: 'Bot service not initialized', data: null });
     }
 
-    await botMonitor.stop();
-    
-    // Store bot state in database
-    await db.collection('bot_config').updateOne(
-      { _id: 'global' },
-      { $set: { isRunning: false, lastStopped: new Date() } },
-      { upsert: true }
+    // Disable bot for current user
+    await db.collection('users').updateOne(
+      { uid: user.uid },
+      { 
+        $set: { 
+          botEnabled: false,
+          botDisabledAt: new Date().toISOString()
+        } 
+      }
     );
+
+    // Check if any other users still have bot enabled
+    const remainingEnabledUsers = await db.collection('users').countDocuments({
+      botEnabled: true,
+      apiKey: { $exists: true },
+      apiSecret: { $exists: true }
+    });
+
+    // Stop conditional bot monitor if no users have bot enabled
+    if (remainingEnabledUsers === 0 && botMonitor.isRunning) {
+      await botMonitor.stop();
+      console.log('⏸️ Stopped conditional bot monitor - no users with botEnabled: true');
+    }
+
+    // Check if any enabled users have active stabilizer bots
+    if (stabilizerBotMonitor.isRunning) {
+      const enabledUsersWithStabilizers = await db.collection('stabilizer_bots').countDocuments({
+        isActive: true,
+        isRunning: true,
+        userId: { 
+          $in: (await db.collection('users').find({ 
+            botEnabled: true,
+            apiKey: { $exists: true },
+            apiSecret: { $exists: true }
+          }).toArray()).map(u => u.uid)
+        }
+      });
+
+      if (enabledUsersWithStabilizers === 0) {
+        await stabilizerBotMonitor.stop();
+        console.log('⏸️ Stopped stabilizer bot monitor - no enabled users with active stabilizers');
+      }
+    }
+
+    // Log activity
+    await db.collection('bot_admin_logs').insertOne({
+      userId: user.uid,
+      action: 'BOT_STOPPED',
+      timestamp: new Date(),
+      details: { message: 'User stopped bot via global stop endpoint' }
+    });
+    
+    console.log(`⏸️ Bot disabled and stopped for user ${user.uid}`);
     
     res.json({
       code: '0',
       msg: 'Bot monitoring service stopped successfully',
-      data: botMonitor.getStatus()
+      data: {
+        botEnabled: false,
+        conditionalBotRunning: botMonitor.isRunning,
+        stabilizerBotRunning: stabilizerBotMonitor.isRunning,
+        remainingEnabledUsers
+      }
     });
   } catch (error) {
     console.error('Error stopping bot:', error);
@@ -1439,6 +1815,15 @@ app.post('/api/bot/user/enable', async (req, res) => {
       return res.status(401).json({ code: '-1', msg: 'Invalid token', data: null });
     }
 
+    // Check if user has API credentials
+    if (!user.apiKey || !user.apiSecret) {
+      return res.status(400).json({
+        code: '-1',
+        msg: 'Please configure your API credentials first before enabling the bot',
+        data: null
+      });
+    }
+
     // Update user's botEnabled flag
     await db.collection('users').updateOne(
       { uid: user.uid },
@@ -1449,6 +1834,24 @@ app.post('/api/bot/user/enable', async (req, res) => {
         } 
       }
     );
+
+    // Auto-start bot monitor if not already running
+    if (!botMonitor.isRunning) {
+      await botMonitor.start();
+      console.log('🤖 Auto-started conditional bot monitor');
+    }
+
+    // Auto-start stabilizer bot monitor if user has active stabilizer bots
+    const userStabilizerBots = await db.collection('stabilizer_bots').countDocuments({
+      userId: user.uid,
+      isActive: true,
+      isRunning: true
+    });
+
+    if (userStabilizerBots > 0 && !stabilizerBotMonitor.isRunning) {
+      await stabilizerBotMonitor.start();
+      console.log('🎯 Auto-started stabilizer bot monitor');
+    }
 
     // Log admin activity
     await db.collection('bot_admin_logs').insertOne({
@@ -1463,7 +1866,11 @@ app.post('/api/bot/user/enable', async (req, res) => {
     res.json({
       code: '0',
       msg: 'Bot enabled successfully',
-      data: { botEnabled: true }
+      data: { 
+        botEnabled: true,
+        botMonitorRunning: botMonitor.isRunning,
+        stabilizerMonitorRunning: stabilizerBotMonitor.isRunning
+      }
     });
   } catch (error) {
     console.error('Error enabling bot:', error);
@@ -1497,6 +1904,39 @@ app.post('/api/bot/user/disable', async (req, res) => {
       }
     );
 
+    // Check if any other users still have bot enabled
+    const remainingEnabledUsers = await db.collection('users').countDocuments({
+      botEnabled: true,
+      apiKey: { $exists: true },
+      apiSecret: { $exists: true }
+    });
+
+    // Stop bot monitor if no users have bot enabled
+    if (remainingEnabledUsers === 0 && botMonitor.isRunning) {
+      await botMonitor.stop();
+      console.log('⏸️ Stopped conditional bot monitor - no users with botEnabled: true');
+    }
+
+    // Check if any enabled users have stabilizer bots
+    if (stabilizerBotMonitor.isRunning) {
+      const enabledUsersWithStabilizers = await db.collection('stabilizer_bots').countDocuments({
+        isActive: true,
+        isRunning: true,
+        userId: { 
+          $in: (await db.collection('users').find({ 
+            botEnabled: true,
+            apiKey: { $exists: true },
+            apiSecret: { $exists: true }
+          }).toArray()).map(u => u.uid)
+        }
+      });
+
+      if (enabledUsersWithStabilizers === 0) {
+        await stabilizerBotMonitor.stop();
+        console.log('⏸️ Stopped stabilizer bot monitor - no enabled users with active stabilizers');
+      }
+    }
+
     // Log admin activity
     await db.collection('bot_admin_logs').insertOne({
       userId: user.uid,
@@ -1510,7 +1950,12 @@ app.post('/api/bot/user/disable', async (req, res) => {
     res.json({
       code: '0',
       msg: 'Bot disabled successfully',
-      data: { botEnabled: false }
+      data: { 
+        botEnabled: false,
+        botMonitorRunning: botMonitor.isRunning,
+        stabilizerMonitorRunning: stabilizerBotMonitor.isRunning,
+        remainingEnabledUsers
+      }
     });
   } catch (error) {
     console.error('Error disabling bot:', error);
@@ -1539,12 +1984,158 @@ app.get('/api/bot/user/status', async (req, res) => {
       data: { 
         botEnabled: user.botEnabled || false,
         botEnabledAt: user.botEnabledAt || null,
-        botDisabledAt: user.botDisabledAt || null
+        botDisabledAt: user.botDisabledAt || null,
+        hasApiCredentials: !!(user.apiKey && user.apiSecret)
       }
     });
   } catch (error) {
     console.error('Error fetching bot status:', error);
     res.status(500).json({ code: '-1', msg: 'Failed to fetch bot status', data: null });
+  }
+});
+
+// POST /api/bot/user/toggle - Toggle bot enabled status for current user
+app.post('/api/bot/user/toggle', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ code: '-1', msg: 'Unauthorized', data: null });
+    }
+
+    const token = authHeader.split(' ')[1];
+    const user = await db.collection('users').findOne({ token });
+    
+    if (!user) {
+      return res.status(401).json({ code: '-1', msg: 'Invalid token', data: null });
+    }
+
+    // Get current status
+    const currentStatus = user.botEnabled || false;
+    const newStatus = !currentStatus;
+
+    if (newStatus) {
+      // Enabling bot - check API credentials
+      if (!user.apiKey || !user.apiSecret) {
+        return res.status(400).json({
+          code: '-1',
+          msg: 'Please configure your API credentials first before enabling the bot',
+          data: { botEnabled: false }
+        });
+      }
+
+      // Update to enabled
+      await db.collection('users').updateOne(
+        { uid: user.uid },
+        { 
+          $set: { 
+            botEnabled: true,
+            botEnabledAt: new Date().toISOString()
+          } 
+        }
+      );
+
+      // Auto-start monitors
+      if (!botMonitor.isRunning) {
+        await botMonitor.start();
+        console.log('🤖 Auto-started conditional bot monitor');
+      }
+
+      const userStabilizerBots = await db.collection('stabilizer_bots').countDocuments({
+        userId: user.uid,
+        isActive: true,
+        isRunning: true
+      });
+
+      if (userStabilizerBots > 0 && !stabilizerBotMonitor.isRunning) {
+        await stabilizerBotMonitor.start();
+        console.log('🎯 Auto-started stabilizer bot monitor');
+      }
+
+      await db.collection('bot_admin_logs').insertOne({
+        userId: user.uid,
+        action: 'BOT_ENABLED',
+        timestamp: new Date(),
+        details: { message: 'User enabled their bot trading via toggle' }
+      });
+
+      console.log(`✅ Bot enabled for user ${user.uid}`);
+
+      res.json({
+        code: '0',
+        msg: 'Bot enabled successfully',
+        data: { 
+          botEnabled: true,
+          botMonitorRunning: botMonitor.isRunning,
+          stabilizerMonitorRunning: stabilizerBotMonitor.isRunning
+        }
+      });
+    } else {
+      // Disabling bot
+      await db.collection('users').updateOne(
+        { uid: user.uid },
+        { 
+          $set: { 
+            botEnabled: false,
+            botDisabledAt: new Date().toISOString()
+          } 
+        }
+      );
+
+      // Check if any other users still have bot enabled
+      const remainingEnabledUsers = await db.collection('users').countDocuments({
+        botEnabled: true,
+        apiKey: { $exists: true },
+        apiSecret: { $exists: true }
+      });
+
+      // Stop monitors if no users have bot enabled
+      if (remainingEnabledUsers === 0 && botMonitor.isRunning) {
+        await botMonitor.stop();
+        console.log('⏸️ Stopped conditional bot monitor - no users with botEnabled: true');
+      }
+
+      if (stabilizerBotMonitor.isRunning) {
+        const enabledUsersWithStabilizers = await db.collection('stabilizer_bots').countDocuments({
+          isActive: true,
+          isRunning: true,
+          userId: { 
+            $in: (await db.collection('users').find({ 
+              botEnabled: true,
+              apiKey: { $exists: true },
+              apiSecret: { $exists: true }
+            }).toArray()).map(u => u.uid)
+          }
+        });
+
+        if (enabledUsersWithStabilizers === 0) {
+          await stabilizerBotMonitor.stop();
+          console.log('⏸️ Stopped stabilizer bot monitor - no enabled users');
+        }
+      }
+
+      await db.collection('bot_admin_logs').insertOne({
+        userId: user.uid,
+        action: 'BOT_DISABLED',
+        timestamp: new Date(),
+        details: { message: 'User disabled their bot trading via toggle' }
+      });
+
+      console.log(`⏸️ Bot disabled for user ${user.uid}`);
+
+      res.json({
+        code: '0',
+        msg: 'Bot disabled successfully',
+        data: { 
+          botEnabled: false,
+          botMonitorRunning: botMonitor.isRunning,
+          stabilizerMonitorRunning: stabilizerBotMonitor.isRunning,
+          remainingEnabledUsers
+        }
+      });
+    }
+  } catch (error) {
+    console.error('Error toggling bot:', error);
+    res.status(500).json({ code: '-1', msg: 'Failed to toggle bot', data: null });
   }
 });
 
@@ -2560,7 +3151,7 @@ connectToMongoDB().then(async () => {
   });
   console.log('✅ Stabilizer Bot Monitor initialized');
 
-  // Auto-start bot if any user has botEnabled: true
+  // Auto-start conditional bot if any user has botEnabled: true
   try {
     // Check for users with botEnabled: true
     const activeUsersCount = await db.collection('users').countDocuments({ 
@@ -2571,23 +3162,15 @@ connectToMongoDB().then(async () => {
 
     if (activeUsersCount > 0) {
       console.log(`🔄 Found ${activeUsersCount} user(s) with bot enabled`);
-      console.log('🤖 Auto-starting bot monitoring service...');
+      console.log('🤖 Auto-starting conditional bot monitoring service...');
       await botMonitor.start();
-      
-      // Save state to database
-      await db.collection('bot_config').updateOne(
-        { _id: 'global' },
-        { $set: { isRunning: true, lastStarted: new Date() } },
-        { upsert: true }
-      );
-      
-      console.log('✅ Bot auto-started successfully');
+      console.log('✅ Conditional bot auto-started successfully');
     } else {
-      console.log('⏸️ Bot not started - no users with botEnabled: true');
+      console.log('⏸️ Conditional bot not started - no users with botEnabled: true');
     }
   } catch (error) {
-    console.error('⚠️ Error checking bot state:', error.message);
-    console.log('⏸️ Bot stopped by default');
+    console.error('⚠️ Error checking conditional bot state:', error.message);
+    console.log('⏸️ Conditional bot stopped by default');
   }
 
   // Auto-start scheduled bot monitor if there are active scheduled bots
@@ -2628,18 +3211,33 @@ connectToMongoDB().then(async () => {
     console.error('⚠️ Error checking market maker bot state:', error.message);
   }
 
-  // Auto-start stabilizer bot monitor if there are active stabilizer bots
+  // Auto-start stabilizer bot monitor if there are active stabilizer bots with enabled users
   try {
-    const activeStabilizerBots = await db.collection('stabilizer_bots').countDocuments({ 
+    const activeStabilizerBots = await db.collection('stabilizer_bots').find({ 
       isActive: true,
       isRunning: true
-    });
+    }).toArray();
 
-    if (activeStabilizerBots > 0) {
-      console.log(`🔄 Found ${activeStabilizerBots} active stabilizer bot(s)`);
-      console.log('🎯 Auto-starting stabilizer bot monitor...');
-      await stabilizerBotMonitor.start();
-      console.log('✅ Stabilizer bot monitor started successfully');
+    if (activeStabilizerBots.length > 0) {
+      // Get unique user IDs
+      const userIds = [...new Set(activeStabilizerBots.map(bot => bot.userId))];
+      
+      // Check how many of these users have botEnabled: true
+      const enabledUsersCount = await db.collection('users').countDocuments({
+        uid: { $in: userIds },
+        botEnabled: true,
+        apiKey: { $exists: true },
+        apiSecret: { $exists: true }
+      });
+
+      if (enabledUsersCount > 0) {
+        console.log(`🔄 Found ${activeStabilizerBots.length} active stabilizer bot(s) for ${enabledUsersCount} enabled user(s)`);
+        console.log('🎯 Auto-starting stabilizer bot monitor...');
+        await stabilizerBotMonitor.start();
+        console.log('✅ Stabilizer bot monitor started successfully');
+      } else {
+        console.log('⏸️ Stabilizer bot monitor not started - no users with botEnabled: true');
+      }
     } else {
       console.log('⏸️ Stabilizer bot monitor not started - no active stabilizer bots');
     }
@@ -2656,6 +3254,10 @@ connectToMongoDB().then(async () => {
     console.log(`\n🧪 Test endpoints (Open API with API Key/Secret):`);
     console.log(`   GET  /api/test/openapi/balance - Test API credentials`);
     console.log(`   GET  /api/test/openapi/ticker  - Get ticker (no auth)`);
+    console.log(`\n📱 Telegram endpoints:`);
+    console.log(`   GET  /api/telegram/test        - Send test notification`);
+    console.log(`   GET  /api/telegram/status      - Check Telegram configuration`);
+    console.log(`   POST /api/telegram/test-stabilizer - Test stabilizer bot with $0.50 order`);
     console.log(`\n� Trade endpoints:`);
     console.log(`   POST /api/trade/order   - Place a trade order`);
     console.log(`   POST /api/trade/cancel  - Cancel an order`);
@@ -2681,12 +3283,17 @@ connectToMongoDB().then(async () => {
     console.log(`   PUT    /api/bot/conditions/:id - Update bot condition`);
     console.log(`   DELETE /api/bot/conditions/:id - Delete bot condition`);
     console.log(`\n🔄 Bot Control endpoints:`);
-    console.log(`   POST /api/bot/start       - Start bot monitoring`);
-    console.log(`   POST /api/bot/stop        - Stop bot monitoring`);
+    console.log(`   POST /api/bot/start       - Start bot monitoring (admin)`);
+    console.log(`   POST /api/bot/stop        - Stop bot monitoring (admin)`);
     console.log(`   GET  /api/bot/status      - Get bot status`);
     console.log(`   GET  /api/bot/logs        - Get bot activity logs`);
     console.log(`   GET  /api/bot/market-data - Get current market data`);
     console.log(`   GET  /api/bot/trades      - Get bot trade history`);
+    console.log(`\n👤 User Bot Control:`);
+    console.log(`   POST /api/bot/user/enable  - Enable bot for current user`);
+    console.log(`   POST /api/bot/user/disable - Disable bot for current user`);
+    console.log(`   POST /api/bot/user/toggle  - Toggle bot on/off`);
+    console.log(`   GET  /api/bot/user/status  - Get user's bot status`);
     console.log(`\n📊 Market Maker Bot endpoints:`);
     console.log(`   POST   /api/bot/market-maker/create      - Create market maker bot`);
     console.log(`   GET    /api/bot/market-maker/list        - Get all market maker bots`);

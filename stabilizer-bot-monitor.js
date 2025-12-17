@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import telegramService from './telegram-service.js';
 
 class StabilizerBotMonitor {
   constructor(db, config = {}) {
@@ -107,11 +108,31 @@ class StabilizerBotMonitor {
         isRunning: true
       }).toArray();
 
-      if (activeBots.length > 0) {
-        this.log('monitor', `Checking ${activeBots.length} active stabilizer bot(s)`);
+      if (activeBots.length === 0) {
+        return;
       }
 
-      for (const bot of activeBots) {
+      // Get unique user IDs from active bots
+      const userIds = [...new Set(activeBots.map(bot => bot.userId))];
+
+      // Check which users have botEnabled: true
+      const enabledUsers = await this.db.collection('users').find({
+        uid: { $in: userIds },
+        botEnabled: true,
+        apiKey: { $exists: true },
+        apiSecret: { $exists: true }
+      }).toArray();
+
+      const enabledUserIds = new Set(enabledUsers.map(u => u.uid));
+
+      // Filter bots to only those whose users have botEnabled: true
+      const enabledBots = activeBots.filter(bot => enabledUserIds.has(bot.userId));
+
+      if (enabledBots.length > 0) {
+        this.log('monitor', `Checking ${enabledBots.length} active stabilizer bot(s) for ${enabledUsers.length} enabled user(s)`);
+      }
+
+      for (const bot of enabledBots) {
         await this.monitorAndStabilize(bot);
       }
     } catch (error) {
@@ -408,6 +429,23 @@ class StabilizerBotMonitor {
             executedAt: new Date(),
             response: result.data
           });
+
+          // Send Telegram notification
+          try {
+            await telegramService.notifyStabilizerBotOrder({
+              botName: bot.name,
+              symbol: bot.symbol,
+              orderNumber: i,
+              totalOrders: 4,
+              usdtAmount: quarterAmount,
+              orderId: result.orderId,
+              marketPrice: marketPrice,
+              targetPrice: targetPrice,
+              status: 'success'
+            });
+          } catch (tgError) {
+            this.log('warning', 'Failed to send Telegram notification', tgError.message, bot._id);
+          }
           
           // Check price after each order - stop if target reached
           const currentPrice = await this.getMarketPrice(bot.symbol);
@@ -434,6 +472,23 @@ class StabilizerBotMonitor {
             error: result.error,
             executedAt: new Date()
           });
+
+          // Send Telegram notification for failed order
+          try {
+            await telegramService.notifyStabilizerBotOrder({
+              botName: bot.name,
+              symbol: bot.symbol,
+              orderNumber: i,
+              totalOrders: 4,
+              usdtAmount: quarterAmount,
+              marketPrice: marketPrice,
+              targetPrice: targetPrice,
+              status: 'failed',
+              error: result.error
+            });
+          } catch (tgError) {
+            this.log('warning', 'Failed to send Telegram notification', tgError.message, bot._id);
+          }
           
           // Stop execution if order fails
           this.log('error', `🛑 Stopping execution due to order failure. Completed: ${successfulOrdersCount}/4`, null, bot._id);

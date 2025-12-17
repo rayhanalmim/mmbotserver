@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import telegramService from './telegram-service.js';
 
 class BotMonitor {
   constructor(db, config = {}) {
@@ -474,6 +475,26 @@ class BotMonitor {
           apiResponse: result
         });
 
+        // Send Telegram notification
+        try {
+          await telegramService.notifyConditionalBotOrder({
+            botName: 'Conditional Bot',
+            conditionName: name,
+            conditionOperator: condition.conditionOperator,
+            conditionValue: condition.conditionValue,
+            orderType: orderBody.type,
+            side: orderBody.side,
+            symbol: result.symbol,
+            volume: volume.toFixed(8),
+            price: result.price || limitPrice,
+            orderId: result.orderId,
+            marketPrice: marketData.price,
+            status: 'success'
+          });
+        } catch (tgError) {
+          this.log('warning', 'Failed to send Telegram notification', tgError.message);
+        }
+
         // Set cooldown
         this.lastTriggers.set(_id.toString(), Date.now());
 
@@ -497,6 +518,26 @@ class BotMonitor {
           executedAt: new Date(),
           apiResponse: result
         });
+
+        // Send Telegram notification for failed order
+        try {
+          await telegramService.notifyConditionalBotOrder({
+            botName: 'Conditional Bot',
+            conditionName: name,
+            conditionOperator: condition.conditionOperator,
+            conditionValue: condition.conditionValue,
+            orderType: orderBody.type,
+            side: orderBody.side,
+            symbol: 'GCBUSDT',
+            volume: volume.toFixed(8),
+            price: limitPrice,
+            marketPrice: marketData.price,
+            status: 'failed',
+            error: result.msg || 'Unknown error'
+          });
+        } catch (tgError) {
+          this.log('warning', 'Failed to send Telegram notification', tgError.message);
+        }
       }
     } catch (error) {
       this.log('error', `Error executing action for condition ${condition._id}`, error.message);
