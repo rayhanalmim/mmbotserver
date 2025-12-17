@@ -190,12 +190,10 @@ app.get('/api/test/openapi/ticker', async (req, res) => {
     const symbol = req.query.symbol || 'GCBUSDT';
     const url = `${GCBEX_OPEN_API_BASE}/sapi/v2/ticker?symbol=${symbol}`;
     
-    console.log(`\n📊 Fetching ticker for ${symbol}...`);
 
     const response = await fetch(url);
     const data = await response.json();
 
-    console.log(`✅ Ticker data:`, data);
 
     return res.json({
       success: true,
