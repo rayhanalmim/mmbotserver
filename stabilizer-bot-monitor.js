@@ -441,7 +441,8 @@ class StabilizerBotMonitor {
               orderId: result.orderId,
               marketPrice: marketPrice,
               targetPrice: targetPrice,
-              status: 'success'
+              status: 'success',
+              userId: bot.userId
             });
           } catch (tgError) {
             this.log('warning', 'Failed to send Telegram notification', tgError.message, bot._id);
@@ -484,7 +485,8 @@ class StabilizerBotMonitor {
               marketPrice: marketPrice,
               targetPrice: targetPrice,
               status: 'failed',
-              error: result.error
+              error: result.error,
+              userId: bot.userId
             });
           } catch (tgError) {
             this.log('warning', 'Failed to send Telegram notification', tgError.message, bot._id);

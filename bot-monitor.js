@@ -489,7 +489,8 @@ class BotMonitor {
             price: result.price || limitPrice,
             orderId: result.orderId,
             marketPrice: marketData.price,
-            status: 'success'
+            status: 'success',
+            userId: user.uid
           });
         } catch (tgError) {
           this.log('warning', 'Failed to send Telegram notification', tgError.message);
@@ -533,7 +534,8 @@ class BotMonitor {
             price: limitPrice,
             marketPrice: marketData.price,
             status: 'failed',
-            error: result.msg || 'Unknown error'
+            error: result.msg || 'Unknown error',
+            userId: user.uid
           });
         } catch (tgError) {
           this.log('warning', 'Failed to send Telegram notification', tgError.message);

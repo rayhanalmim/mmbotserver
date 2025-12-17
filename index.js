@@ -382,7 +382,8 @@ app.post('/api/telegram/test-stabilizer', async (req, res) => {
         orderId: result.orderId,
         marketPrice: marketPrice,
         targetPrice: marketPrice, // For test, use same price
-        status: 'success'
+        status: 'success',
+        userId: user.uid
       });
 
       if (notificationResult.success) {
@@ -415,7 +416,8 @@ app.post('/api/telegram/test-stabilizer', async (req, res) => {
         marketPrice: marketPrice,
         targetPrice: marketPrice,
         status: 'failed',
-        error: result.msg || 'Unknown error'
+        error: result.msg || 'Unknown error',
+        userId: user.uid
       });
 
       return res.status(400).json({

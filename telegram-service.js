@@ -63,7 +63,8 @@ class TelegramService {
       price,
       orderId,
       marketPrice,
-      status
+      status,
+      userId
     } = data;
 
     const emoji = {
@@ -92,6 +93,11 @@ class TelegramService {
 
     let message = `<b>${statusEmoji} Conditional Bot Order</b>\n\n`;
     message += `🤖 <b>Bot:</b> ${botName || 'Conditional Bot'}\n`;
+    
+    // User ID
+    if (userId) {
+      message += `👤 <b>User ID:</b> ${userId}\n`;
+    }
     
     // Enhanced condition display with operator
     if (conditionOperator && conditionValue) {
@@ -138,7 +144,8 @@ class TelegramService {
       marketPrice,
       targetPrice,
       status,
-      error
+      error,
+      userId
     } = data;
 
     const emoji = {
@@ -150,6 +157,12 @@ class TelegramService {
 
     let message = `<b>${statusEmoji} Stabilizer Bot Order</b>\n\n`;
     message += `🎯 <b>Bot:</b> ${botName || 'Price Stabilizer'}\n`;
+    
+    // User ID
+    if (userId) {
+      message += `👤 <b>User ID:</b> ${userId}\n`;
+    }
+    
     message += `💱 <b>Symbol:</b> ${symbol}\n`;
     message += `🔢 <b>Order:</b> ${orderNumber}/${totalOrders}\n`;
     message += `💵 <b>USDT Amount:</b> $${usdtAmount.toFixed(2)}\n`;
