@@ -96,14 +96,14 @@ class TelegramService {
     
     // User ID
     if (userId) {
-      message += `👤 <b>User ID:</b> ${userId}\n`;
+      // message += `👤 <b>User ID:</b> ${userId}\n`;
     }
     
     // Enhanced condition display with operator
     if (conditionOperator && conditionValue) {
       const opEmoji = operatorEmoji[conditionOperator] || '📊';
       const opText = operatorText[conditionOperator] || conditionOperator;
-      message += `📋 <b>Condition:</b> ${conditionName}\n`;
+      // message += `📋 <b>Condition:</b> ${conditionName}\n`;
       message += `${opEmoji} <b>Trigger:</b> GCB Price ${opText} $${conditionValue}\n`;
     } else {
       message += `📋 <b>Condition:</b> ${conditionName}\n`;
@@ -120,10 +120,10 @@ class TelegramService {
     }
 
     if (orderId) {
-      message += `🔢 <b>Order ID:</b> ${orderId}\n`;
+      // message += `🔢 <b>Order ID:</b> ${orderId}\n`;
     }
 
-    message += `⏰ <b>Time:</b> ${new Date().toLocaleString()}\n`;
+    message += `⏰ <b>Time (UTC):</b> ${new Date().toUTCString()}\n`;
 
     if (status === 'failed' && data.error) {
       message += `\n❌ <b>Error:</b> ${data.error}`;
@@ -160,20 +160,20 @@ class TelegramService {
     
     // User ID
     if (userId) {
-      message += `👤 <b>User ID:</b> ${userId}\n`;
+      // message += `👤 <b>User ID:</b> ${userId}\n`;
     }
     
     message += `💱 <b>Symbol:</b> ${symbol}\n`;
-    message += `🔢 <b>Order:</b> ${orderNumber}/${totalOrders}\n`;
+    // message += `🔢 <b>Order:</b> ${orderNumber}/${totalOrders}\n`;
     message += `💵 <b>USDT Amount:</b> $${usdtAmount.toFixed(2)}\n`;
     message += `📊 <b>Market Price:</b> $${marketPrice.toFixed(6)}\n`;
     message += `🎯 <b>Target Price:</b> $${targetPrice.toFixed(6)}\n`;
 
     if (orderId) {
-      message += `🔢 <b>Order ID:</b> ${orderId}\n`;
+      // message += `🔢 <b>Order ID:</b> ${orderId}\n`;
     }
 
-    message += `⏰ <b>Time:</b> ${new Date().toLocaleString()}\n`;
+    message += `⏰ <b>Time (UTC):</b> ${new Date().toUTCString()}\n`;
 
     if (status === 'failed' && error) {
       message += `\n❌ <b>Error:</b> ${error}`;
@@ -203,7 +203,7 @@ class TelegramService {
   async sendTestNotification() {
     const message = `<b>🧪 Test Notification</b>\n\n` +
       `✅ Telegram integration is working correctly!\n` +
-      `⏰ Time: ${new Date().toLocaleString()}`;
+      `⏰ Time (UTC): ${new Date().toUTCString()}`;
     
     return await this.sendMessage(message);
   }
