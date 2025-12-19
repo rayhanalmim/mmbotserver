@@ -92,7 +92,7 @@ class TelegramService {
     const sideEmoji = emoji[side] || '💱';
 
     let message = `<b>${statusEmoji} Conditional Bot Order</b>\n\n`;
-    message += `🤖 <b>Bot:</b> ${botName || 'Conditional Bot'}\n`;
+    message += `🤖 <b>Bot:</b> ${'Conditional Bot'}\n`;
     
     // User ID
     if (userId) {
@@ -156,7 +156,7 @@ class TelegramService {
     const statusEmoji = status === 'success' ? emoji.success : emoji.failed;
 
     let message = `<b>${statusEmoji} Stabilizer Bot Order</b>\n\n`;
-    message += `🎯 <b>Bot:</b> ${botName || 'Price Stabilizer'}\n`;
+    message += `🎯 <b>Bot:</b> ${'Price Stabilizer'}\n`;
     
     // User ID
     if (userId) {
