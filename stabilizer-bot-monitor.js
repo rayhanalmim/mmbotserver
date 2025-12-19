@@ -250,6 +250,13 @@ class StabilizerBotMonitor {
     // We need to consume ALL asks up to AND INCLUDING the target price
     let requiredUSDT = 0;
     let cumulativeVolume = 0;
+    let hasGap = false;
+    
+    // Check if there's a gap: no ask orders at or below target price
+    const ordersAtOrBelowTarget = orderBook.asks.filter(ask => ask.price <= targetPrice);
+    if (ordersAtOrBelowTarget.length === 0 && orderBook.asks.length > 0) {
+      hasGap = true;
+    }
     
     for (const ask of orderBook.asks) {
       // Break only if ask price is GREATER than target (not equal)
@@ -268,7 +275,9 @@ class StabilizerBotMonitor {
     return {
       requiredUSDT: requiredUSDT,
       tokensNeeded: cumulativeVolume,
-      levelsToConsume: orderBook.asks.filter(ask => ask.price <= targetPrice).length
+      levelsToConsume: orderBook.asks.filter(ask => ask.price <= targetPrice).length,
+      hasGap: hasGap,
+      lowestAskPrice: orderBook.asks.length > 0 ? orderBook.asks[0].price : null
     };
   }
 
@@ -280,6 +289,49 @@ class StabilizerBotMonitor {
         side: 'BUY',
         type: 'MARKET',
         volume: usdtAmount.toFixed(symbolInfo.quantityPrecision) // Use correct precision from symbol info
+      };
+
+      const timestamp = (await this.getServerTime()).toString();
+      const method = 'POST';
+      const requestPath = '/sapi/v2/order';
+      const bodyJson = JSON.stringify(orderBody, null, 0).replace(/\s/g, '');
+      const message = `${timestamp}${method.toUpperCase()}${requestPath}${bodyJson}`;
+      const signature = crypto
+        .createHmac('sha256', user.apiSecret)
+        .update(message)
+        .digest('hex');
+
+      const response = await fetch(`${this.openApiBase}${requestPath}`, {
+        method: 'POST',
+        headers: {
+          'X-CH-APIKEY': user.apiKey,
+          'X-CH-TS': timestamp,
+          'X-CH-SIGN': signature,
+          'Content-Type': 'application/json'
+        },
+        body: bodyJson
+      });
+
+      const result = await response.json();
+      
+      if (result.orderId) {
+        return { success: true, orderId: result.orderId, data: result };
+      } else {
+        return { success: false, error: result.msg || 'Unknown error', data: result };
+      }
+    } catch (error) {
+      return { success: false, error: error.message };
+    }
+  }
+
+  async executeLimitSell(user, symbol, price, quantity, symbolInfo) {
+    try {
+      const orderBody = {
+        symbol: symbol,
+        side: 'SELL',
+        type: 'LIMIT',
+        price: price.toFixed(symbolInfo.pricePrecision),
+        volume: quantity.toFixed(symbolInfo.quantityPrecision)
       };
 
       const timestamp = (await this.getServerTime()).toString();
@@ -369,14 +421,191 @@ class StabilizerBotMonitor {
       
       this.log('calculate', `📊 Calculation: Need $${calculation.requiredUSDT.toFixed(2)} USDT to buy ${calculation.tokensNeeded.toFixed(2)} tokens across ${calculation.levelsToConsume} price levels`, null, bot._id);
 
+      // Get symbol precision info
+      const symbolInfo = await this.getSymbolInfo(bot.symbol);
+      this.log('info', `📏 Symbol precision: Price=${symbolInfo.pricePrecision} decimals, Volume=${symbolInfo.quantityPrecision} decimals`, null, bot._id);
+
+      // Check for gap scenario: no orders at or below target price
+      if (calculation.hasGap) {
+        this.log('warning', `🔍 GAP DETECTED! No ask orders at or below target price $${targetPrice.toFixed(6)}. Lowest ask: $${calculation.lowestAskPrice.toFixed(6)}`, null, bot._id);
+        this.log('info', `🎯 Gap-filling strategy: Will place 50 GCB in 4 limit sell orders (12.5 GCB each), then buy them`, null, bot._id);
+        
+        // Check user balance for GCB tokens
+        const balances = await this.getUserBalance(user);
+        if (!balances) {
+          this.log('error', '❌ Failed to fetch user balance', null, bot._id);
+          return;
+        }
+
+        const gcbBalance = balances.find(b => b.asset.toUpperCase() === 'GCB');
+        const availableGcb = gcbBalance ? parseFloat(gcbBalance.free) : 0;
+        
+        const totalGapFillAmount = 50;
+        const quarterGcb = totalGapFillAmount / 4;
+        
+        if (availableGcb < totalGapFillAmount) {
+          this.log('error', `❌ Insufficient GCB balance for gap filling. Need ${totalGapFillAmount} GCB, have ${availableGcb.toFixed(2)}`, null, bot._id);
+          return;
+        }
+
+        this.log('info', `📦 Available GCB: ${availableGcb.toFixed(2)} | Will place ${totalGapFillAmount} GCB in 4 orders of ${quarterGcb.toFixed(2)} GCB each`, null, bot._id);
+        
+        const usdtBalance = balances.find(b => b.asset.toUpperCase() === 'USDT');
+        const availableUsdt = usdtBalance ? parseFloat(usdtBalance.free) : 0;
+        const totalUsdtNeeded = totalGapFillAmount * targetPrice;
+        
+        if (availableUsdt < totalUsdtNeeded) {
+          this.log('error', `❌ Insufficient USDT for gap filling. Need $${totalUsdtNeeded.toFixed(2)}, have $${availableUsdt.toFixed(2)}`, null, bot._id);
+          return;
+        }
+        
+        this.log('info', `💰 Available USDT: $${availableUsdt.toFixed(2)} | Total needed: $${totalUsdtNeeded.toFixed(2)}`, null, bot._id);
+        this.log('info', `⏱️ Will execute over 40 seconds (4 orders × 10 second intervals)`, null, bot._id);
+
+        let successfulGapFillCount = 0;
+        let totalUsdtSpent = 0;
+        
+        for (let i = 1; i <= 4; i++) {
+          this.log('info', `🔄 Gap-fill order ${i}/4: Placing ${quarterGcb.toFixed(2)} GCB limit sell at $${targetPrice.toFixed(6)}`, null, bot._id);
+          
+          // Place limit sell order at target price
+          const limitSellResult = await this.executeLimitSell(user, bot.symbol, targetPrice, quarterGcb, symbolInfo);
+          
+          if (!limitSellResult.success) {
+            this.log('error', `❌ Failed to place gap-filling limit sell order ${i}/4: ${limitSellResult.error}`, null, bot._id);
+            break;
+          }
+          
+          this.log('success', `✅ Limit sell order ${i}/4 placed! Order ID: ${limitSellResult.orderId}`, null, bot._id);
+          
+          // Wait 2 seconds for order to be placed in order book
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          
+          // Calculate USDT needed to buy this quarter
+          const usdtForThisOrder = quarterGcb * targetPrice;
+          
+          // Execute market buy to consume the limit sell order
+          this.log('trade', `💱 Executing market buy ${i}/4: $${usdtForThisOrder.toFixed(2)} USDT`, null, bot._id);
+          
+          const gapBuyResult = await this.executeMarketBuy(user, bot.symbol, usdtForThisOrder, symbolInfo);
+          
+          if (!gapBuyResult.success) {
+            this.log('error', `❌ Gap-filling market buy ${i}/4 failed: ${gapBuyResult.error}`, null, bot._id);
+            break;
+          }
+          
+          successfulGapFillCount++;
+          totalUsdtSpent += usdtForThisOrder;
+          
+          this.log('success', `✅ Market buy ${i}/4 executed! Order ID: ${gapBuyResult.orderId}`, null, bot._id);
+          
+          // Save gap-fill trade to database
+          await this.db.collection('stabilizer_bot_trades').insertOne({
+            stabilizerBotId: bot._id,
+            userId: bot.userId,
+            symbol: bot.symbol,
+            orderType: 'gap-fill',
+            orderNumber: i,
+            totalOrders: 4,
+            limitSellOrderId: limitSellResult.orderId,
+            marketBuyOrderId: gapBuyResult.orderId,
+            gcbAmount: quarterGcb,
+            usdtAmount: usdtForThisOrder,
+            marketPrice: marketPrice,
+            targetPrice: targetPrice,
+            status: 'success',
+            executedAt: new Date(),
+            response: gapBuyResult.data
+          });
+
+          // Send Telegram notification
+          try {
+            await telegramService.notifyStabilizerBotOrder({
+              botName: bot.name,
+              symbol: bot.symbol,
+              orderNumber: i,
+              totalOrders: 4,
+              usdtAmount: usdtForThisOrder,
+              orderId: gapBuyResult.orderId,
+              marketPrice: marketPrice,
+              targetPrice: targetPrice,
+              status: 'success',
+              userId: bot.userId
+            });
+          } catch (tgError) {
+            this.log('warning', 'Failed to send Telegram notification', tgError.message, bot._id);
+          }
+          
+          // Check if target price reached after each order
+          const currentPrice = await this.getMarketPrice(bot.symbol);
+          if (currentPrice && currentPrice >= targetPrice) {
+            this.log('success', `🎯 Target price reached! Current: $${currentPrice.toFixed(6)} >= Target: $${targetPrice.toFixed(6)}`, null, bot._id);
+            this.log('success', `✅ Gap-filling achieved with ${i}/4 orders. Stopping early.`, null, bot._id);
+            
+            // Update bot statistics
+            await this.db.collection('stabilizer_bots').updateOne(
+              { _id: bot._id },
+              { 
+                $set: { 
+                  lastExecutedAt: new Date(),
+                  lastCheckedAt: new Date(),
+                  lastMarketPrice: marketPrice,
+                  lastFinalPrice: currentPrice
+                },
+                $inc: { 
+                  executionCount: 1,
+                  totalUsdtSpent: totalUsdtSpent
+                }
+              }
+            );
+            
+            return;
+          }
+          
+          // Wait 10 seconds before next order (except for last one)
+          if (i < 4) {
+            this.log('info', `⏳ Waiting 10 seconds before gap-fill order ${i + 1}/4...`, null, bot._id);
+            await new Promise(resolve => setTimeout(resolve, 10000));
+          }
+        }
+        
+        // Check final price after all orders
+        const finalPrice = await this.getMarketPrice(bot.symbol);
+        
+        if (successfulGapFillCount > 0) {
+          if (finalPrice >= targetPrice) {
+            this.log('success', `🎯 Gap-filling complete! ${successfulGapFillCount}/4 orders executed. Price moved from $${marketPrice.toFixed(6)} to $${finalPrice.toFixed(6)}. Target reached!`, null, bot._id);
+          } else {
+            this.log('warning', `⚠️ Gap-filling incomplete. ${successfulGapFillCount}/4 orders executed but target not reached. Price: $${finalPrice.toFixed(6)} (target: $${targetPrice.toFixed(6)})`, null, bot._id);
+          }
+          
+          // Update bot statistics
+          await this.db.collection('stabilizer_bots').updateOne(
+            { _id: bot._id },
+            { 
+              $set: { 
+                lastExecutedAt: new Date(),
+                lastCheckedAt: new Date(),
+                lastMarketPrice: marketPrice,
+                lastFinalPrice: finalPrice
+              },
+              $inc: { 
+                executionCount: 1,
+                totalUsdtSpent: totalUsdtSpent
+              }
+            }
+          );
+        } else {
+          this.log('error', `❌ Gap-filling failed. No orders succeeded.`, null, bot._id);
+        }
+        
+        return;
+      }
+
       if (calculation.requiredUSDT === 0 || calculation.requiredUSDT < 1) {
         this.log('warning', 'Required USDT too low, skipping execution', null, bot._id);
         return;
       }
-
-      // Get symbol precision info
-      const symbolInfo = await this.getSymbolInfo(bot.symbol);
-      this.log('info', `📏 Symbol precision: Price=${symbolInfo.pricePrecision} decimals, Volume=${symbolInfo.quantityPrecision} decimals`, null, bot._id);
 
       // Check user balance before executing
       const balances = await this.getUserBalance(user);
