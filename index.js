@@ -7,6 +7,7 @@ import BotMonitor from './bot-monitor.js';
 import ScheduledBotMonitor from './scheduled-bot-monitor.js';
 import MarketMakerBotMonitor from './market-maker-bot-monitor.js';
 import StabilizerBotMonitor from './stabilizer-bot-monitor.js';
+import BuyWallBotMonitor from './buywall-bot-monitor.js';
 import telegramService from './telegram-service.js';
 
 const app = express();
@@ -41,6 +42,7 @@ let botMonitor;
 let scheduledBotMonitor;
 let marketMakerBotMonitor;
 let stabilizerBotMonitor;
+let buyWallBotMonitor;
 
 // Connect to MongoDB
 async function connectToMongoDB() {
@@ -1226,7 +1228,7 @@ app.post('/api/trade/cancel-order', async (req, res) => {
     const method = 'POST';
     const requestPath = '/sapi/v2/cancel';
     const bodyJson = JSON.stringify(cancelBody, null, 0).replace(/\s/g, '');
-    const signature = generateUserSignature(timestamp, method, requestPath, bodyJson, user.apiSecret);
+    const signature = generateUserSignature(user.apiSecret, timestamp, method, requestPath, bodyJson);
 
     // Call GCBEX Open API
     const response = await fetch(`${GCBEX_OPEN_API_BASE}${requestPath}`, {
@@ -1309,7 +1311,7 @@ app.post('/api/trade/place-order', async (req, res) => {
     const method = 'POST';
     const requestPath = '/sapi/v2/order';
     const bodyJson = JSON.stringify(orderBody, null, 0).replace(/\s/g, '');
-    const signature = generateUserSignature(timestamp, method, requestPath, bodyJson, user.apiSecret);
+    const signature = generateUserSignature(user.apiSecret, timestamp, method, requestPath, bodyJson);
 
     // Prepare headers
     const headers = {
@@ -3118,6 +3120,481 @@ app.get('/api/bot/market-maker/status', async (req, res) => {
 });
 
 // ============================================
+// Buy Wall Bot Endpoints
+// ============================================
+
+// POST /api/bot/buywall/create - Create a buy wall bot
+app.post('/api/bot/buywall/create', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ code: '-1', msg: 'Unauthorized', data: null });
+    }
+
+    const token = authHeader.split(' ')[1];
+    const user = await db.collection('users').findOne({ token });
+    
+    if (!user) {
+      return res.status(401).json({ code: '-1', msg: 'Invalid token', data: null });
+    }
+
+    if (!user.apiKey || !user.apiSecret) {
+      return res.status(400).json({ 
+        code: '-1', 
+        msg: 'API credentials required. Please add your API credentials first.', 
+        data: null 
+      });
+    }
+
+    const { name, targetPrice, buyOrders } = req.body;
+
+    if (!targetPrice || !buyOrders || !Array.isArray(buyOrders) || buyOrders.length === 0) {
+      return res.status(400).json({ 
+        code: '-1', 
+        msg: 'Missing required fields: targetPrice and buyOrders array', 
+        data: null 
+      });
+    }
+
+    // Validate buyOrders format
+    for (const order of buyOrders) {
+      if (!order.price || !order.usdtAmount || order.price <= 0 || order.usdtAmount <= 0) {
+        return res.status(400).json({ 
+          code: '-1', 
+          msg: 'Each buy order must have valid price and usdtAmount (> 0)', 
+          data: null 
+        });
+      }
+    }
+
+    // Sort buyOrders by price descending
+    const sortedOrders = buyOrders
+      .map(o => ({ price: parseFloat(o.price), usdtAmount: parseFloat(o.usdtAmount) }))
+      .sort((a, b) => b.price - a.price);
+
+    const totalUsdt = sortedOrders.reduce((sum, o) => sum + o.usdtAmount, 0);
+
+    const buyWallBot = {
+      userId: user.uid,
+      name: name || `Buy Wall Bot - ${new Date().toISOString()}`,
+      symbol: 'GCBUSDT',
+      targetPrice: parseFloat(targetPrice),
+      buyOrders: sortedOrders,
+      totalUsdt: totalUsdt,
+      ordersPlaced: false,
+      placedOrders: [],
+      failedOrders: [],
+      totalRefills: 0,
+      isActive: false,
+      isRunning: false,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      status: 'created'
+    };
+
+    const result = await db.collection('buywall_bots').insertOne(buyWallBot);
+    const createdBot = await db.collection('buywall_bots').findOne({ _id: result.insertedId });
+
+    console.log(`✅ Buy Wall bot created: ${createdBot._id} for user ${user.uid} with ${sortedOrders.length} orders totaling $${totalUsdt.toFixed(2)}`);
+
+    res.json({
+      code: '0',
+      msg: 'Buy Wall bot created successfully',
+      data: createdBot
+    });
+  } catch (error) {
+    console.error('Error creating buy wall bot:', error);
+    res.status(500).json({ code: '-1', msg: 'Failed to create buy wall bot', data: null });
+  }
+});
+
+// GET /api/bot/buywall/list - Get all buy wall bots for user
+app.get('/api/bot/buywall/list', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ code: '-1', msg: 'Unauthorized', data: null });
+    }
+
+    const token = authHeader.split(' ')[1];
+    const user = await db.collection('users').findOne({ token });
+    
+    if (!user) {
+      return res.status(401).json({ code: '-1', msg: 'Invalid token', data: null });
+    }
+
+    const bots = await db.collection('buywall_bots')
+      .find({ userId: user.uid })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.json({
+      code: '0',
+      msg: 'Success',
+      data: bots
+    });
+  } catch (error) {
+    console.error('Error fetching buy wall bots:', error);
+    res.status(500).json({ code: '-1', msg: 'Failed to fetch buy wall bots', data: null });
+  }
+});
+
+// POST /api/bot/buywall/:id/start - Start a buy wall bot
+app.post('/api/bot/buywall/:id/start', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ code: '-1', msg: 'Unauthorized', data: null });
+    }
+
+    const token = authHeader.split(' ')[1];
+    const user = await db.collection('users').findOne({ token });
+    
+    if (!user) {
+      return res.status(401).json({ code: '-1', msg: 'Invalid token', data: null });
+    }
+
+    const botId = req.params.id;
+    const bot = await db.collection('buywall_bots').findOne({ 
+      _id: new ObjectId(botId), 
+      userId: user.uid 
+    });
+
+    if (!bot) {
+      return res.status(404).json({ code: '-1', msg: 'Buy Wall bot not found', data: null });
+    }
+
+    await db.collection('buywall_bots').updateOne(
+      { _id: new ObjectId(botId) },
+      { 
+        $set: { 
+          isActive: true,
+          isRunning: true,
+          status: 'running',
+          updatedAt: new Date()
+        } 
+      }
+    );
+
+    // Start the monitor if not already running
+    if (!buyWallBotMonitor.isRunning) {
+      await buyWallBotMonitor.start();
+    }
+
+    console.log(`🚀 Buy Wall bot started: ${botId}`);
+
+    res.json({
+      code: '0',
+      msg: 'Buy Wall bot started successfully',
+      data: { botId }
+    });
+  } catch (error) {
+    console.error('Error starting buy wall bot:', error);
+    res.status(500).json({ code: '-1', msg: 'Failed to start buy wall bot', data: null });
+  }
+});
+
+// POST /api/bot/buywall/:id/stop - Stop a buy wall bot
+app.post('/api/bot/buywall/:id/stop', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ code: '-1', msg: 'Unauthorized', data: null });
+    }
+
+    const token = authHeader.split(' ')[1];
+    const user = await db.collection('users').findOne({ token });
+    
+    if (!user) {
+      return res.status(401).json({ code: '-1', msg: 'Invalid token', data: null });
+    }
+
+    const botId = req.params.id;
+    
+    await db.collection('buywall_bots').updateOne(
+      { _id: new ObjectId(botId), userId: user.uid },
+      { 
+        $set: { 
+          isActive: false,
+          isRunning: false,
+          status: 'stopped',
+          stoppedAt: new Date(),
+          updatedAt: new Date()
+        } 
+      }
+    );
+
+    console.log(`⏸️ Buy Wall bot stopped: ${botId}`);
+
+    res.json({
+      code: '0',
+      msg: 'Buy Wall bot stopped successfully',
+      data: { botId }
+    });
+  } catch (error) {
+    console.error('Error stopping buy wall bot:', error);
+    res.status(500).json({ code: '-1', msg: 'Failed to stop buy wall bot', data: null });
+  }
+});
+
+// DELETE /api/bot/buywall/:id - Delete a buy wall bot
+app.delete('/api/bot/buywall/:id', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ code: '-1', msg: 'Unauthorized', data: null });
+    }
+
+    const token = authHeader.split(' ')[1];
+    const user = await db.collection('users').findOne({ token });
+    
+    if (!user) {
+      return res.status(401).json({ code: '-1', msg: 'Invalid token', data: null });
+    }
+
+    const botId = req.params.id;
+    const result = await db.collection('buywall_bots').deleteOne({
+      _id: new ObjectId(botId),
+      userId: user.uid
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ code: '-1', msg: 'Buy Wall bot not found' });
+    }
+
+    // Also delete related trades and logs
+    await db.collection('buywall_bot_trades').deleteMany({ botId: new ObjectId(botId) });
+    await db.collection('buywall_bot_logs').deleteMany({ botId: new ObjectId(botId) });
+
+    res.json({
+      code: '0',
+      msg: 'Buy Wall bot deleted successfully'
+    });
+  } catch (error) {
+    console.error('Error deleting buy wall bot:', error);
+    res.status(500).json({ code: '-1', msg: 'Failed to delete buy wall bot' });
+  }
+});
+
+// PUT /api/bot/buywall/:id - Update a buy wall bot (add/modify orders)
+app.put('/api/bot/buywall/:id', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ code: '-1', msg: 'Unauthorized', data: null });
+    }
+
+    const token = authHeader.split(' ')[1];
+    const user = await db.collection('users').findOne({ token });
+    
+    if (!user) {
+      return res.status(401).json({ code: '-1', msg: 'Invalid token', data: null });
+    }
+
+    const botId = req.params.id;
+    const bot = await db.collection('buywall_bots').findOne({ 
+      _id: new ObjectId(botId), 
+      userId: user.uid 
+    });
+
+    if (!bot) {
+      return res.status(404).json({ code: '-1', msg: 'Buy Wall bot not found', data: null });
+    }
+
+    const { name, targetPrice, buyOrders } = req.body;
+    const updates = { updatedAt: new Date() };
+
+    if (name) updates.name = name;
+    if (targetPrice) updates.targetPrice = parseFloat(targetPrice);
+    
+    if (buyOrders && Array.isArray(buyOrders)) {
+      const sortedOrders = buyOrders
+        .map(o => ({ price: parseFloat(o.price), usdtAmount: parseFloat(o.usdtAmount) }))
+        .sort((a, b) => b.price - a.price);
+      updates.buyOrders = sortedOrders;
+      updates.totalUsdt = sortedOrders.reduce((sum, o) => sum + o.usdtAmount, 0);
+    }
+
+    await db.collection('buywall_bots').updateOne(
+      { _id: new ObjectId(botId) },
+      { $set: updates }
+    );
+
+    const updatedBot = await db.collection('buywall_bots').findOne({ _id: new ObjectId(botId) });
+
+    res.json({
+      code: '0',
+      msg: 'Buy Wall bot updated successfully',
+      data: updatedBot
+    });
+  } catch (error) {
+    console.error('Error updating buy wall bot:', error);
+    res.status(500).json({ code: '-1', msg: 'Failed to update buy wall bot', data: null });
+  }
+});
+
+// GET /api/bot/buywall/:id/logs - Get logs for a buy wall bot
+app.get('/api/bot/buywall/:id/logs', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ code: '-1', msg: 'Unauthorized', data: null });
+    }
+
+    const token = authHeader.split(' ')[1];
+    const user = await db.collection('users').findOne({ token });
+    
+    if (!user) {
+      return res.status(401).json({ code: '-1', msg: 'Invalid token', data: null });
+    }
+
+    const botId = req.params.id;
+    const limit = parseInt(req.query.limit) || 100;
+
+    const logs = await db.collection('buywall_bot_logs')
+      .find({ botId: new ObjectId(botId) })
+      .sort({ timestamp: -1 })
+      .limit(limit)
+      .toArray();
+
+    res.json({
+      code: '0',
+      msg: 'Success',
+      data: logs
+    });
+  } catch (error) {
+    console.error('Error fetching buy wall bot logs:', error);
+    res.status(500).json({ code: '-1', msg: 'Failed to fetch logs', data: null });
+  }
+});
+
+// GET /api/bot/buywall/:id/trades - Get trade history for a buy wall bot
+app.get('/api/bot/buywall/:id/trades', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ code: '-1', msg: 'Unauthorized', data: null });
+    }
+
+    const token = authHeader.split(' ')[1];
+    const user = await db.collection('users').findOne({ token });
+    
+    if (!user) {
+      return res.status(401).json({ code: '-1', msg: 'Invalid token', data: null });
+    }
+
+    const botId = req.params.id;
+    const trades = await db.collection('buywall_bot_trades')
+      .find({ botId: new ObjectId(botId), userId: user.uid })
+      .sort({ executedAt: -1 })
+      .toArray();
+
+    res.json({
+      code: '0',
+      msg: 'Success',
+      data: trades
+    });
+  } catch (error) {
+    console.error('Error fetching buy wall bot trades:', error);
+    res.status(500).json({ code: '-1', msg: 'Failed to fetch trades', data: null });
+  }
+});
+
+// GET /api/bot/buywall/logs - Get all buy wall bot activity logs
+app.get('/api/bot/buywall/logs', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ code: '-1', msg: 'Unauthorized', data: null });
+    }
+
+    const limit = parseInt(req.query.limit) || 100;
+
+    if (!buyWallBotMonitor) {
+      return res.json({
+        code: '0',
+        msg: 'Success',
+        data: []
+      });
+    }
+
+    res.json({
+      code: '0',
+      msg: 'Success',
+      data: buyWallBotMonitor.getLogs(limit)
+    });
+  } catch (error) {
+    console.error('Error fetching buy wall bot logs:', error);
+    res.status(500).json({ code: '-1', msg: 'Failed to fetch logs', data: null });
+  }
+});
+
+// GET /api/bot/buywall/status - Get buy wall bot monitor status
+app.get('/api/bot/buywall/status', async (req, res) => {
+  try {
+    if (!buyWallBotMonitor) {
+      return res.json({
+        code: '0',
+        msg: 'Success',
+        data: { isRunning: false }
+      });
+    }
+
+    res.json({
+      code: '0',
+      msg: 'Success',
+      data: buyWallBotMonitor.getStatus()
+    });
+  } catch (error) {
+    console.error('Error getting buy wall bot status:', error);
+    res.status(500).json({ code: '-1', msg: 'Failed to get buy wall bot status', data: null });
+  }
+});
+
+// POST /api/bot/buywall/:id/reset - Reset a buy wall bot (clear placed orders, start fresh)
+app.post('/api/bot/buywall/:id/reset', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ code: '-1', msg: 'Unauthorized', data: null });
+    }
+
+    const token = authHeader.split(' ')[1];
+    const user = await db.collection('users').findOne({ token });
+    
+    if (!user) {
+      return res.status(401).json({ code: '-1', msg: 'Invalid token', data: null });
+    }
+
+    const botId = req.params.id;
+    
+    await db.collection('buywall_bots').updateOne(
+      { _id: new ObjectId(botId), userId: user.uid },
+      { 
+        $set: { 
+          ordersPlaced: false,
+          placedOrders: [],
+          failedOrders: [],
+          totalRefills: 0,
+          updatedAt: new Date()
+        } 
+      }
+    );
+
+    console.log(`🔄 Buy Wall bot reset: ${botId}`);
+
+    res.json({
+      code: '0',
+      msg: 'Buy Wall bot reset successfully',
+      data: { botId }
+    });
+  } catch (error) {
+    console.error('Error resetting buy wall bot:', error);
+    res.status(500).json({ code: '-1', msg: 'Failed to reset buy wall bot', data: null });
+  }
+});
+
+// ============================================
 // Start Server
 // ============================================
 connectToMongoDB().then(async () => {
@@ -3150,6 +3627,10 @@ connectToMongoDB().then(async () => {
     checkInterval: 5000 // Check every 5 seconds
   });
   console.log('✅ Stabilizer Bot Monitor initialized');
+
+  // Initialize Buy Wall Bot Monitor
+  buyWallBotMonitor = new BuyWallBotMonitor(db);
+  console.log('✅ Buy Wall Bot Monitor initialized');
 
   // Auto-start conditional bot if any user has botEnabled: true
   try {
@@ -3245,6 +3726,38 @@ connectToMongoDB().then(async () => {
     console.error('⚠️ Error checking stabilizer bot state:', error.message);
   }
 
+  // Auto-start buy wall bot monitor if there are active buy wall bots with enabled users
+  try {
+    const activeBuyWallBots = await db.collection('buywall_bots').find({ 
+      isActive: true,
+      isRunning: true
+    }).toArray();
+
+    if (activeBuyWallBots.length > 0) {
+      const userIds = [...new Set(activeBuyWallBots.map(bot => bot.userId))];
+      
+      const enabledUsersCount = await db.collection('users').countDocuments({
+        uid: { $in: userIds },
+        botEnabled: true,
+        apiKey: { $exists: true },
+        apiSecret: { $exists: true }
+      });
+
+      if (enabledUsersCount > 0) {
+        console.log(`🔄 Found ${activeBuyWallBots.length} active buy wall bot(s) for ${enabledUsersCount} enabled user(s)`);
+        console.log('🧱 Auto-starting buy wall bot monitor...');
+        await buyWallBotMonitor.start();
+        console.log('✅ Buy wall bot monitor started successfully');
+      } else {
+        console.log('⏸️ Buy wall bot monitor not started - no users with botEnabled: true');
+      }
+    } else {
+      console.log('⏸️ Buy wall bot monitor not started - no active buy wall bots');
+    }
+  } catch (error) {
+    console.error('⚠️ Error checking buy wall bot state:', error.message);
+  }
+
   app.listen(PORT, () => {
     console.log(`🚀 MMBot Server running on http://localhost:${PORT}`);
     console.log(`📊 API endpoints available at http://localhost:${PORT}/api`);
@@ -3319,6 +3832,14 @@ process.on('SIGINT', async () => {
   if (marketMakerBotMonitor && marketMakerBotMonitor.isRunning) {
     await marketMakerBotMonitor.stop();
     console.log('✅ Market maker bot monitor stopped');
+  }
+  if (stabilizerBotMonitor && stabilizerBotMonitor.isRunning) {
+    await stabilizerBotMonitor.stop();
+    console.log('✅ Stabilizer bot monitor stopped');
+  }
+  if (buyWallBotMonitor && buyWallBotMonitor.isRunning) {
+    await buyWallBotMonitor.stop();
+    console.log('✅ Buy wall bot monitor stopped');
   }
   if (client) {
     await client.close();

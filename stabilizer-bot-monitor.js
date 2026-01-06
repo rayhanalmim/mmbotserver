@@ -13,6 +13,7 @@ class StabilizerBotMonitor {
     this.checkTimer = null;
     this.logs = [];
     this.maxLogs = 1000;
+    this.processingBots = new Set(); // In-memory lock to prevent duplicate processing
   }
 
   log(level, message, data = null, botId = null) {
@@ -368,6 +369,14 @@ class StabilizerBotMonitor {
   }
 
   async monitorAndStabilize(bot) {
+    const botId = bot._id.toString();
+    
+    // Check if this bot is already being processed (prevent race condition)
+    if (this.processingBots.has(botId)) {
+      this.log('info', `[${bot.name}] Already processing, skipping...`, null, bot._id);
+      return;
+    }
+    
     try {
       this.log('monitor', `Monitoring: ${bot.name}`, null, bot._id);
 
@@ -407,7 +416,11 @@ class StabilizerBotMonitor {
       }
 
       // Price is below target - need to stabilize
-      this.log('warning', `⚠️ Price BELOW target by $${(targetPrice - marketPrice).toFixed(6)}. Stabilization needed!`, null, bot._id);
+      // Add to processing set to prevent duplicate executions during the 40+ second order sequence
+      this.processingBots.add(botId);
+      
+      try {
+        this.log('warning', `⚠️ Price BELOW target by $${(targetPrice - marketPrice).toFixed(6)}. Stabilization needed!`, null, bot._id);
 
       // Get order book to calculate required USDT
       const orderBook = await this.getOrderBookDepth(bot.symbol);
@@ -776,9 +789,15 @@ class StabilizerBotMonitor {
           }
         }
       );
+      } finally {
+        // Always remove from processing set when done
+        this.processingBots.delete(botId);
+      }
 
     } catch (error) {
       this.log('error', `Error in stabilization cycle for bot ${bot._id}`, error.message, bot._id);
+      // Also remove from processing set on error
+      this.processingBots.delete(botId);
     }
   }
 }
