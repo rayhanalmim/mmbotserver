@@ -271,7 +271,7 @@ class BuyWallBotMonitor {
           );
           
           this.log('success', `[${bot.name}] Price hit target! Placing all buy wall orders...`);
-          await this.placeAllBuyOrders(bot, user, symbolInfo);
+          await this.placeAllBuyOrders(bot, user, symbolInfo, marketPrice);
         } finally {
           // Remove from processing set
           this.processingBots.delete(botId);
@@ -289,12 +289,24 @@ class BuyWallBotMonitor {
     }
   }
 
-  async placeAllBuyOrders(bot, user, symbolInfo) {
+  async placeAllBuyOrders(bot, user, symbolInfo, marketPrice) {
     const buyOrders = bot.buyOrders || [];
     const placedOrders = [];
     const failedOrders = [];
+    const skippedOrders = [];
 
     for (const order of buyOrders) {
+      // Skip orders that are at or above market price - buy wall should be BELOW market
+      if (order.price >= marketPrice) {
+        skippedOrders.push({
+          price: order.price,
+          usdtAmount: order.usdtAmount,
+          reason: `Price $${order.price} is >= market price $${marketPrice.toFixed(6)}`
+        });
+        this.log('warning', `[${bot.name}] Skipping order at $${order.price} - above market price $${marketPrice.toFixed(6)}`);
+        continue;
+      }
+
       const result = await this.placeLimitBuyOrder(
         user,
         bot.symbol || 'GCBUSDT',
@@ -420,6 +432,32 @@ class BuyWallBotMonitor {
     const refillFailures = [];
 
     for (const order of filledOrders) {
+      // Skip refilling orders that are at or above market price - buy wall should be BELOW market
+      if (order.price >= marketPrice) {
+        this.log('warning', `[${bot.name}] Skipping refill at $${order.price} - above market price $${marketPrice.toFixed(6)}`);
+        refillFailures.push({
+          price: order.price,
+          usdtAmount: order.usdtAmount,
+          error: `Skipped - price above market ($${marketPrice.toFixed(6)})`
+        });
+        
+        // Save skip to database for UI display
+        await this.db.collection('buywall_bot_logs').insertOne({
+          botId: bot._id,
+          botName: bot.name,
+          userId: bot.userId,
+          action: 'SKIP',
+          message: `Skipped refill at $${order.price} - above market price $${marketPrice.toFixed(6)}`,
+          details: { 
+            orderPrice: order.price,
+            marketPrice: marketPrice,
+            reason: 'PRICE_ABOVE_MARKET'
+          },
+          timestamp: new Date()
+        });
+        continue;
+      }
+
       // Check if we need to top up a partially filled order first
       // Find if there's a corresponding order in stillOpenOrders that was partially filled
       const partialOrder = stillOpenOrders.find(o => 
@@ -428,6 +466,13 @@ class BuyWallBotMonitor {
       );
 
       if (partialOrder) {
+        // Skip partial top-up if price is at or above market
+        if (partialOrder.price >= marketPrice) {
+          this.log('warning', `[${bot.name}] Skipping partial top-up at $${partialOrder.price} - above market price`);
+          partialOrder.partiallyFilled = false;
+          continue;
+        }
+
         // Top up the partial order first
         const filledUsdtAmount = partialOrder.executedQuantity * partialOrder.price;
         this.log('info', `Topping up partial order at $${partialOrder.price}, filled: ${filledUsdtAmount.toFixed(2)} USDT`);

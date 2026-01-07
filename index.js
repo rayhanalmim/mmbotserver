@@ -2685,6 +2685,56 @@ app.delete('/api/bot/stabilizer/:id', async (req, res) => {
   }
 });
 
+// PUT /api/bot/stabilizer/:id/max-buy - Update max buy amount for a stabilizer bot
+app.put('/api/bot/stabilizer/:id/max-buy', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ code: '-1', msg: 'Unauthorized', data: null });
+    }
+
+    const token = authHeader.split(' ')[1];
+    const user = await db.collection('users').findOne({ token });
+    
+    if (!user) {
+      return res.status(401).json({ code: '-1', msg: 'Invalid token', data: null });
+    }
+
+    const { id } = req.params;
+    const { maxBuyAmount } = req.body;
+
+    // Validate maxBuyAmount
+    const parsedMaxBuy = parseFloat(maxBuyAmount) || 0;
+    if (parsedMaxBuy < 0) {
+      return res.status(400).json({ code: '-1', msg: 'Max buy amount cannot be negative', data: null });
+    }
+
+    const result = await db.collection('stabilizer_bots').updateOne(
+      { _id: new ObjectId(id), userId: user.uid },
+      { 
+        $set: { 
+          maxBuyAmount: parsedMaxBuy,
+          thresholdExceeded: false, // Reset threshold exceeded flag when updating
+          updatedAt: new Date() 
+        } 
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ code: '-1', msg: 'Stabilizer bot not found', data: null });
+    }
+
+    res.json({
+      code: '0',
+      msg: 'Max buy amount updated successfully',
+      data: { maxBuyAmount: parsedMaxBuy }
+    });
+  } catch (error) {
+    console.error('Error updating max buy amount:', error);
+    res.status(500).json({ code: '-1', msg: 'Failed to update max buy amount' });
+  }
+});
+
 // GET /api/bot/stabilizer/:id/logs - Get logs for a stabilizer bot
 app.get('/api/bot/stabilizer/:id/logs', async (req, res) => {
   try {

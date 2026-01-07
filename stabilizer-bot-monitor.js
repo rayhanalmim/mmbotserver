@@ -434,6 +434,33 @@ class StabilizerBotMonitor {
       
       this.log('calculate', `📊 Calculation: Need $${calculation.requiredUSDT.toFixed(2)} USDT to buy ${calculation.tokensNeeded.toFixed(2)} tokens across ${calculation.levelsToConsume} price levels`, null, bot._id);
 
+      // Check if required amount exceeds maxBuyAmount threshold
+      const maxBuyAmount = bot.maxBuyAmount || 0; // 0 means no limit
+      if (maxBuyAmount > 0 && calculation.requiredUSDT > maxBuyAmount) {
+        this.log('warning', `🚫 Required USDT ($${calculation.requiredUSDT.toFixed(2)}) exceeds max buy threshold ($${maxBuyAmount.toFixed(2)}). Skipping execution until admin updates threshold.`, null, bot._id);
+        
+        // Update bot with last exceeded amount for reference
+        await this.db.collection('stabilizer_bots').updateOne(
+          { _id: bot._id },
+          { 
+            $set: { 
+              lastCheckedAt: new Date(),
+              lastExceededAmount: calculation.requiredUSDT,
+              thresholdExceeded: true
+            }
+          }
+        );
+        return;
+      }
+
+      // Clear threshold exceeded flag if we pass the check
+      if (bot.thresholdExceeded) {
+        await this.db.collection('stabilizer_bots').updateOne(
+          { _id: bot._id },
+          { $set: { thresholdExceeded: false } }
+        );
+      }
+
       // Get symbol precision info
       const symbolInfo = await this.getSymbolInfo(bot.symbol);
       this.log('info', `📏 Symbol precision: Price=${symbolInfo.pricePrecision} decimals, Volume=${symbolInfo.quantityPrecision} decimals`, null, bot._id);
