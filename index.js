@@ -8,6 +8,7 @@ import ScheduledBotMonitor from './scheduled-bot-monitor.js';
 import MarketMakerBotMonitor from './market-maker-bot-monitor.js';
 import StabilizerBotMonitor from './stabilizer-bot-monitor.js';
 import BuyWallBotMonitor from './buywall-bot-monitor.js';
+import PriceKeeperBotMonitor from './price-keeper-bot-monitor.js';
 import telegramService from './telegram-service.js';
 
 const app = express();
@@ -43,6 +44,7 @@ let scheduledBotMonitor;
 let marketMakerBotMonitor;
 let stabilizerBotMonitor;
 let buyWallBotMonitor;
+let priceKeeperBotMonitor;
 
 // Connect to MongoDB
 async function connectToMongoDB() {
@@ -3645,6 +3647,370 @@ app.post('/api/bot/buywall/:id/reset', async (req, res) => {
 });
 
 // ============================================
+// Price Keeper Bot Endpoints
+// ============================================
+
+// POST /api/bot/price-keeper/create - Create a price keeper bot
+app.post('/api/bot/price-keeper/create', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ code: '-1', msg: 'Unauthorized', data: null });
+    }
+
+    const token = authHeader.split(' ')[1];
+    const user = await db.collection('users').findOne({ token });
+    
+    if (!user) {
+      return res.status(401).json({ code: '-1', msg: 'Invalid token', data: null });
+    }
+
+    if (!user.apiKey || !user.apiSecret) {
+      return res.status(400).json({ 
+        code: '-1', 
+        msg: 'API credentials required. Please add your API credentials first.', 
+        data: null 
+      });
+    }
+
+    const { name, orderAmount, cooldownSeconds, telegramEnabled } = req.body;
+
+    const priceKeeperBot = {
+      userId: user.uid,
+      name: name || `Price Keeper Bot - ${new Date().toISOString()}`,
+      symbol: 'GCBUSDT',
+      orderAmount: parseFloat(orderAmount) || 0.1, // Default 0.1 USDT
+      cooldownSeconds: parseInt(cooldownSeconds) || 5, // Default 5 seconds cooldown
+      telegramEnabled: telegramEnabled || false,
+      isActive: false,
+      isRunning: false,
+      executionCount: 0,
+      totalUsdtSpent: 0,
+      lastExecutedAt: null,
+      lastCheckedAt: null,
+      lastMarketPrice: null,
+      lastBestAskPrice: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      status: 'created'
+    };
+
+    const result = await db.collection('price_keeper_bots').insertOne(priceKeeperBot);
+    const createdBot = await db.collection('price_keeper_bots').findOne({ _id: result.insertedId });
+
+    console.log(`✅ Price Keeper bot created: ${createdBot._id} for user ${user.uid}`);
+
+    res.json({
+      code: '0',
+      msg: 'Price Keeper bot created successfully',
+      data: createdBot
+    });
+  } catch (error) {
+    console.error('Error creating price keeper bot:', error);
+    res.status(500).json({ code: '-1', msg: 'Failed to create price keeper bot', data: null });
+  }
+});
+
+// GET /api/bot/price-keeper/list - Get all price keeper bots for user
+app.get('/api/bot/price-keeper/list', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ code: '-1', msg: 'Unauthorized', data: null });
+    }
+
+    const token = authHeader.split(' ')[1];
+    const user = await db.collection('users').findOne({ token });
+    
+    if (!user) {
+      return res.status(401).json({ code: '-1', msg: 'Invalid token', data: null });
+    }
+
+    const bots = await db.collection('price_keeper_bots')
+      .find({ userId: user.uid })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.json({
+      code: '0',
+      msg: 'Success',
+      data: bots
+    });
+  } catch (error) {
+    console.error('Error fetching price keeper bots:', error);
+    res.status(500).json({ code: '-1', msg: 'Failed to fetch price keeper bots', data: null });
+  }
+});
+
+// POST /api/bot/price-keeper/:id/start - Start a price keeper bot
+app.post('/api/bot/price-keeper/:id/start', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ code: '-1', msg: 'Unauthorized', data: null });
+    }
+
+    const token = authHeader.split(' ')[1];
+    const user = await db.collection('users').findOne({ token });
+    
+    if (!user) {
+      return res.status(401).json({ code: '-1', msg: 'Invalid token', data: null });
+    }
+
+    const botId = req.params.id;
+    const bot = await db.collection('price_keeper_bots').findOne({ 
+      _id: new ObjectId(botId), 
+      userId: user.uid 
+    });
+
+    if (!bot) {
+      return res.status(404).json({ code: '-1', msg: 'Price Keeper bot not found', data: null });
+    }
+
+    await db.collection('price_keeper_bots').updateOne(
+      { _id: new ObjectId(botId) },
+      { 
+        $set: { 
+          isActive: true,
+          isRunning: true,
+          status: 'running',
+          updatedAt: new Date()
+        } 
+      }
+    );
+
+    // Start the monitor if not already running
+    if (priceKeeperBotMonitor && !priceKeeperBotMonitor.isRunning) {
+      await priceKeeperBotMonitor.start();
+    }
+
+    console.log(`🚀 Price Keeper bot started: ${botId}`);
+
+    res.json({
+      code: '0',
+      msg: 'Price Keeper bot started successfully',
+      data: { botId }
+    });
+  } catch (error) {
+    console.error('Error starting price keeper bot:', error);
+    res.status(500).json({ code: '-1', msg: 'Failed to start price keeper bot', data: null });
+  }
+});
+
+// POST /api/bot/price-keeper/:id/stop - Stop a price keeper bot
+app.post('/api/bot/price-keeper/:id/stop', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ code: '-1', msg: 'Unauthorized', data: null });
+    }
+
+    const token = authHeader.split(' ')[1];
+    const user = await db.collection('users').findOne({ token });
+    
+    if (!user) {
+      return res.status(401).json({ code: '-1', msg: 'Invalid token', data: null });
+    }
+
+    const botId = req.params.id;
+
+    await db.collection('price_keeper_bots').updateOne(
+      { _id: new ObjectId(botId), userId: user.uid },
+      { 
+        $set: { 
+          isActive: false,
+          isRunning: false,
+          status: 'stopped',
+          updatedAt: new Date()
+        } 
+      }
+    );
+
+    console.log(`⏹️ Price Keeper bot stopped: ${botId}`);
+
+    res.json({
+      code: '0',
+      msg: 'Price Keeper bot stopped successfully',
+      data: { botId }
+    });
+  } catch (error) {
+    console.error('Error stopping price keeper bot:', error);
+    res.status(500).json({ code: '-1', msg: 'Failed to stop price keeper bot', data: null });
+  }
+});
+
+// DELETE /api/bot/price-keeper/:id - Delete a price keeper bot
+app.delete('/api/bot/price-keeper/:id', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ code: '-1', msg: 'Unauthorized', data: null });
+    }
+
+    const token = authHeader.split(' ')[1];
+    const user = await db.collection('users').findOne({ token });
+    
+    if (!user) {
+      return res.status(401).json({ code: '-1', msg: 'Invalid token', data: null });
+    }
+
+    const botId = req.params.id;
+    const result = await db.collection('price_keeper_bots').deleteOne({
+      _id: new ObjectId(botId),
+      userId: user.uid
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ code: '-1', msg: 'Price Keeper bot not found', data: null });
+    }
+
+    // Also delete logs for this bot
+    await db.collection('price_keeper_bot_logs').deleteMany({ botId: botId });
+
+    console.log(`🗑️ Price Keeper bot deleted: ${botId}`);
+
+    res.json({
+      code: '0',
+      msg: 'Price Keeper bot deleted successfully'
+    });
+  } catch (error) {
+    console.error('Error deleting price keeper bot:', error);
+    res.status(500).json({ code: '-1', msg: 'Failed to delete price keeper bot', data: null });
+  }
+});
+
+// GET /api/bot/price-keeper/:id/logs - Get logs for a specific price keeper bot
+app.get('/api/bot/price-keeper/:id/logs', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ code: '-1', msg: 'Unauthorized', data: null });
+    }
+
+    const token = authHeader.split(' ')[1];
+    const user = await db.collection('users').findOne({ token });
+    
+    if (!user) {
+      return res.status(401).json({ code: '-1', msg: 'Invalid token', data: null });
+    }
+
+    const botId = req.params.id;
+    const limit = parseInt(req.query.limit) || 100;
+
+    const logs = await db.collection('price_keeper_bot_logs')
+      .find({ botId: botId, userId: user.uid })
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .toArray();
+
+    res.json({
+      code: '0',
+      msg: 'Success',
+      data: logs
+    });
+  } catch (error) {
+    console.error('Error fetching price keeper bot logs:', error);
+    res.status(500).json({ code: '-1', msg: 'Failed to fetch logs', data: null });
+  }
+});
+
+// GET /api/bot/price-keeper/logs - Get all price keeper bot logs (monitor logs)
+app.get('/api/bot/price-keeper/logs', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ code: '-1', msg: 'Unauthorized', data: null });
+    }
+
+    const limit = parseInt(req.query.limit) || 100;
+
+    if (!priceKeeperBotMonitor) {
+      return res.json({
+        code: '0',
+        msg: 'Success',
+        data: []
+      });
+    }
+
+    res.json({
+      code: '0',
+      msg: 'Success',
+      data: priceKeeperBotMonitor.getLogs(limit)
+    });
+  } catch (error) {
+    console.error('Error fetching price keeper bot logs:', error);
+    res.status(500).json({ code: '-1', msg: 'Failed to fetch logs', data: null });
+  }
+});
+
+// GET /api/bot/price-keeper/status - Get price keeper bot monitor status
+app.get('/api/bot/price-keeper/status', async (req, res) => {
+  try {
+    if (!priceKeeperBotMonitor) {
+      return res.json({
+        code: '0',
+        msg: 'Success',
+        data: { isRunning: false }
+      });
+    }
+
+    res.json({
+      code: '0',
+      msg: 'Success',
+      data: priceKeeperBotMonitor.getStatus()
+    });
+  } catch (error) {
+    console.error('Error getting price keeper bot status:', error);
+    res.status(500).json({ code: '-1', msg: 'Failed to get price keeper bot status', data: null });
+  }
+});
+
+// PUT /api/bot/price-keeper/:id - Update a price keeper bot
+app.put('/api/bot/price-keeper/:id', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({ code: '-1', msg: 'Unauthorized', data: null });
+    }
+
+    const token = authHeader.split(' ')[1];
+    const user = await db.collection('users').findOne({ token });
+    
+    if (!user) {
+      return res.status(401).json({ code: '-1', msg: 'Invalid token', data: null });
+    }
+
+    const botId = req.params.id;
+    const { orderAmount, cooldownSeconds } = req.body;
+
+    const updateFields = { updatedAt: new Date() };
+    if (orderAmount !== undefined) updateFields.orderAmount = parseFloat(orderAmount);
+    if (cooldownSeconds !== undefined) updateFields.cooldownSeconds = parseInt(cooldownSeconds);
+
+    await db.collection('price_keeper_bots').updateOne(
+      { _id: new ObjectId(botId), userId: user.uid },
+      { $set: updateFields }
+    );
+
+    const updatedBot = await db.collection('price_keeper_bots').findOne({ 
+      _id: new ObjectId(botId), 
+      userId: user.uid 
+    });
+
+    console.log(`✏️ Price Keeper bot updated: ${botId}`);
+
+    res.json({
+      code: '0',
+      msg: 'Price Keeper bot updated successfully',
+      data: updatedBot
+    });
+  } catch (error) {
+    console.error('Error updating price keeper bot:', error);
+    res.status(500).json({ code: '-1', msg: 'Failed to update price keeper bot', data: null });
+  }
+});
+
+// ============================================
 // Start Server
 // ============================================
 connectToMongoDB().then(async () => {
@@ -3681,6 +4047,10 @@ connectToMongoDB().then(async () => {
   // Initialize Buy Wall Bot Monitor
   buyWallBotMonitor = new BuyWallBotMonitor(db);
   console.log('✅ Buy Wall Bot Monitor initialized');
+
+  // Initialize Price Keeper Bot Monitor
+  priceKeeperBotMonitor = new PriceKeeperBotMonitor(db);
+  console.log('✅ Price Keeper Bot Monitor initialized');
 
   // Auto-start conditional bot if any user has botEnabled: true
   try {
@@ -3890,6 +4260,10 @@ process.on('SIGINT', async () => {
   if (buyWallBotMonitor && buyWallBotMonitor.isRunning) {
     await buyWallBotMonitor.stop();
     console.log('✅ Buy wall bot monitor stopped');
+  }
+  if (priceKeeperBotMonitor && priceKeeperBotMonitor.isRunning) {
+    await priceKeeperBotMonitor.stop();
+    console.log('✅ Price keeper bot monitor stopped');
   }
   if (client) {
     await client.close();
