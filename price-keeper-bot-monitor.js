@@ -144,6 +144,42 @@ class PriceKeeperBotMonitor {
     }
   }
 
+  async getUserBalance(user) {
+    try {
+      const timestamp = Date.now().toString();
+      const method = 'GET';
+      const requestPath = '/sapi/v1/account';
+      const signature = this.generateSignature(timestamp, method, requestPath, '', user.apiSecret);
+
+      const response = await fetch(`${GCBEX_OPEN_API_BASE}${requestPath}`, {
+        method: 'GET',
+        headers: {
+          'X-CH-APIKEY': user.apiKey,
+          'X-CH-TS': timestamp,
+          'X-CH-SIGN': signature,
+        },
+      });
+
+      const data = await response.json();
+      
+      if (data.balances) {
+        const balanceMap = {};
+        data.balances.forEach(balance => {
+          balanceMap[balance.asset] = {
+            free: balance.free,
+            locked: balance.locked,
+            total: (parseFloat(balance.free) + parseFloat(balance.locked)).toString()
+          };
+        });
+        return balanceMap;
+      }
+      return null;
+    } catch (error) {
+      this.log('error', `Failed to fetch user balance: ${error.message}`);
+      return null;
+    }
+  }
+
   async placeMarketBuyOrder(user, symbol, usdtAmount, symbolInfo) {
     try {
       // For market buy, volume is the USDT amount to spend (quote currency)
@@ -336,14 +372,22 @@ class PriceKeeperBotMonitor {
 
             this.log('success', `[${bot.name}] ✅ Executed price keeper order: $${orderAmount} USDT`);
 
-            // Send Telegram notification
+            // Send Telegram notification with balance
             try {
+              // Fetch user balance
+              const balance = await this.getUserBalance(user);
+              const gcbBalance = balance?.GCB?.free || '0';
+              const usdtBalance = balance?.USDT?.free || '0';
+              
               const message = `<b>🎯 Price Keeper Bot Order</b>\n\n` +
                 `🤖 <b>Bot:</b> ${bot.name}\n` +
                 `💱 <b>Symbol:</b> ${symbol}\n` +
                 `💵 <b>Order Amount:</b> $${orderAmount}\n` +
                 `📊 <b>Market Price:</b> $${marketPrice.toFixed(6)}\n` +
-                `🎯 <b>Best Ask:</b> $${bestAskPrice.toFixed(6)}\n` +
+                `🎯 <b>Best Ask:</b> $${bestAskPrice.toFixed(6)}\n\n` +
+                `💰 <b>Account Balance:</b>\n` +
+                `   • GCB: ${parseFloat(gcbBalance).toFixed(2)}\n` +
+                `   • USDT: ${parseFloat(usdtBalance).toFixed(2)}\n\n` +
                 `⏰ <b>Time (UTC):</b> ${new Date().toUTCString()}`;
               
               await telegramService.sendMessage(message);
