@@ -10,6 +10,8 @@ import StabilizerBotMonitor from './stabilizer-bot-monitor.js';
 import BuyWallBotMonitor from './buywall-bot-monitor.js';
 import PriceKeeperBotMonitor from './price-keeper-bot-monitor.js';
 import telegramService from './telegram-service.js';
+import { setupMexcRoutes, setupMexcMMBotRoutes } from './mexc-routes.js';
+import MexcMMBotMonitor from './mexc-mm-bot-monitor.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -45,6 +47,7 @@ let marketMakerBotMonitor;
 let stabilizerBotMonitor;
 let buyWallBotMonitor;
 let priceKeeperBotMonitor;
+let mexcMMBotMonitor;
 
 // Connect to MongoDB
 async function connectToMongoDB() {
@@ -68,6 +71,9 @@ app.use(cors({
   credentials: true
 }));
 app.use(express.json());
+
+// Setup MEXC routes
+setupMexcRoutes(app);
 
 // Rate limiting removed for better performance
 
@@ -4051,6 +4057,19 @@ connectToMongoDB().then(async () => {
   // Initialize Price Keeper Bot Monitor
   priceKeeperBotMonitor = new PriceKeeperBotMonitor(db);
   console.log('✅ Price Keeper Bot Monitor initialized');
+
+  // Initialize MEXC MM Bot Monitor
+  mexcMMBotMonitor = new MexcMMBotMonitor(db);
+  setupMexcMMBotRoutes(app, db, mexcMMBotMonitor);
+  console.log('✅ MEXC MM Bot Monitor initialized');
+
+  // Always start MEXC MM Bot Monitor (it will check for running bots)
+  try {
+    await mexcMMBotMonitor.start();
+    console.log('✅ MEXC MM Bot Monitor started');
+  } catch (error) {
+    console.error('⚠️ Error starting MEXC MM Bot Monitor:', error.message);
+  }
 
   // Auto-start conditional bot if any user has botEnabled: true
   try {
