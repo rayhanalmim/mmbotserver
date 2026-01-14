@@ -12,6 +12,13 @@ import PriceKeeperBotMonitor from './price-keeper-bot-monitor.js';
 import telegramService from './telegram-service.js';
 import { setupMexcRoutes, setupMexcMMBotRoutes } from './mexc-routes.js';
 import MexcMMBotMonitor from './mexc-mm-bot-monitor.js';
+import { setupMexcUserRoutes } from './mexc-user-routes.js';
+import { setupMexcUserApiRoutes, setUserBotMonitor } from './mexc-user-api-routes.js';
+import MexcUserBotMonitor from './mexc-user-bot-monitor.js';
+import { setupXtRoutes } from './xt-routes.js';
+import { setupXtUserRoutes } from './xt-user-routes.js';
+import { setupXtUserApiRoutes, setXtUserBotMonitor } from './xt-user-api-routes.js';
+import XtUserBotMonitor from './xt-user-bot-monitor.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -48,6 +55,8 @@ let stabilizerBotMonitor;
 let buyWallBotMonitor;
 let priceKeeperBotMonitor;
 let mexcMMBotMonitor;
+let mexcUserBotMonitor;
+let xtUserBotMonitor;
 
 // Connect to MongoDB
 async function connectToMongoDB() {
@@ -4071,6 +4080,40 @@ connectToMongoDB().then(async () => {
     console.error('⚠️ Error starting MEXC MM Bot Monitor:', error.message);
   }
 
+  // Initialize MEXC User Routes (for separate MEXC client)
+  setupMexcUserRoutes(app, db);
+  setupMexcUserApiRoutes(app, db);
+  console.log('✅ MEXC User Auth & API routes initialized');
+
+  // Initialize and start MEXC User Bot Monitor
+  mexcUserBotMonitor = new MexcUserBotMonitor(db);
+  setUserBotMonitor(mexcUserBotMonitor);
+  try {
+    await mexcUserBotMonitor.start();
+    console.log('✅ MEXC User Bot Monitor started');
+  } catch (error) {
+    console.error('⚠️ Error starting MEXC User Bot Monitor:', error.message);
+  }
+
+  // Initialize XT Routes (public endpoints)
+  setupXtRoutes(app);
+  console.log('✅ XT public routes initialized');
+
+  // Initialize XT User Routes (for XT credential management)
+  setupXtUserRoutes(app, db);
+  setupXtUserApiRoutes(app, db);
+  console.log('✅ XT User Auth & API routes initialized');
+
+  // Initialize and start XT User Bot Monitor
+  xtUserBotMonitor = new XtUserBotMonitor(db);
+  setXtUserBotMonitor(xtUserBotMonitor);
+  try {
+    await xtUserBotMonitor.start();
+    console.log('✅ XT User Bot Monitor started');
+  } catch (error) {
+    console.error('⚠️ Error starting XT User Bot Monitor:', error.message);
+  }
+
   // Auto-start conditional bot if any user has botEnabled: true
   try {
     // Check for users with botEnabled: true
@@ -4283,6 +4326,10 @@ process.on('SIGINT', async () => {
   if (priceKeeperBotMonitor && priceKeeperBotMonitor.isRunning) {
     await priceKeeperBotMonitor.stop();
     console.log('✅ Price keeper bot monitor stopped');
+  }
+  if (xtUserBotMonitor && xtUserBotMonitor.isRunning) {
+    await xtUserBotMonitor.stop();
+    console.log('✅ XT User bot monitor stopped');
   }
   if (client) {
     await client.close();
