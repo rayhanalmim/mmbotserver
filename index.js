@@ -19,6 +19,8 @@ import { setupXtRoutes } from './xt-routes.js';
 import { setupXtUserRoutes } from './xt-user-routes.js';
 import { setupXtUserApiRoutes, setXtUserBotMonitor } from './xt-user-api-routes.js';
 import XtUserBotMonitor from './xt-user-bot-monitor.js';
+import { setupXtLiquidityBotRoutes, setXtLiquidityBotMonitor } from './xt-liquidity-bot-routes.js';
+import XtLiquidityBotMonitor from './xt-liquidity-bot-monitor.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -57,6 +59,7 @@ let priceKeeperBotMonitor;
 let mexcMMBotMonitor;
 let mexcUserBotMonitor;
 let xtUserBotMonitor;
+let xtLiquidityBotMonitor;
 
 // Connect to MongoDB
 async function connectToMongoDB() {
@@ -4123,6 +4126,17 @@ connectToMongoDB().then(async () => {
     console.error('⚠️ Error starting XT User Bot Monitor:', error.message);
   }
 
+  // Initialize XT Liquidity Bot Routes and Monitor
+  setupXtLiquidityBotRoutes(app, db);
+  xtLiquidityBotMonitor = new XtLiquidityBotMonitor(db);
+  setXtLiquidityBotMonitor(xtLiquidityBotMonitor);
+  try {
+    await xtLiquidityBotMonitor.start();
+    console.log('✅ XT Liquidity Bot Monitor started');
+  } catch (error) {
+    console.error('⚠️ Error starting XT Liquidity Bot Monitor:', error.message);
+  }
+
   // Auto-start conditional bot if any user has botEnabled: true
   try {
     // Check for users with botEnabled: true
@@ -4339,6 +4353,10 @@ process.on('SIGINT', async () => {
   if (xtUserBotMonitor && xtUserBotMonitor.isRunning) {
     await xtUserBotMonitor.stop();
     console.log('✅ XT User bot monitor stopped');
+  }
+  if (xtLiquidityBotMonitor && xtLiquidityBotMonitor.isRunning) {
+    await xtLiquidityBotMonitor.stop();
+    console.log('✅ XT Liquidity bot monitor stopped');
   }
   if (client) {
     await client.close();

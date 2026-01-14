@@ -5,7 +5,7 @@ const XT_BASE_URL = 'https://sapi.xt.com';
 
 // Replace these with your VPS-whitelisted credentials
 const API_KEY = 'db15208f-233c-45d0-9ca6-bf6fc7a91177';
-const API_SECRET = '55dde4d683349f361c4afd8e5225f2bf9c180e35';
+const API_SECRET = 'YOUR_VPS_API_SECRET';
 
 function generateXtSignature(secretKey, original) {
   return crypto
