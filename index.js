@@ -74,7 +74,7 @@ async function connectToMongoDB() {
 }
 // Middleware
 app.use(cors({
-  origin: ["https://bot.gcbtoken.io", "http://localhost:3000"],
+  origin: ["https://bot.gcbtoken.io", "https://xt.gcbtoken.io", "http://localhost:3000", "http://localhost:3005"],
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
   credentials: true
