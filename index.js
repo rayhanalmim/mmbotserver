@@ -4099,6 +4099,15 @@ connectToMongoDB().then(async () => {
   setupXtRoutes(app);
   console.log('✅ XT public routes initialized');
 
+  // Initialize XT Server Time Sync (CRITICAL for AUTH_104 fix)
+  const { syncXtServerTime } = await import('./xt-user-routes.js');
+  try {
+    await syncXtServerTime();
+    console.log('✅ XT server time synchronized');
+  } catch (error) {
+    console.error('⚠️ Failed to sync XT server time:', error.message);
+  }
+
   // Initialize XT User Routes (for XT credential management)
   setupXtUserRoutes(app, db);
   setupXtUserApiRoutes(app, db);
