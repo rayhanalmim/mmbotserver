@@ -164,6 +164,79 @@ export function setupXtLiquidityBotRoutes(app, db) {
     }
   });
 
+  // GET /api/xt-user/liquidity-bot/open-orders - Get all open orders for symbol
+  app.get('/api/xt-user/liquidity-bot/open-orders', verifyXtToken, async (req, res) => {
+    try {
+      const symbol = req.query.symbol || 'gcb_usdt';
+      const credentials = await getXtUserCredentials(db, req.xtUser.id);
+      if (!credentials) {
+        return res.status(401).json({ code: '-1', msg: 'XT credentials not found', data: null });
+      }
+      if (xtLiquidityBotMonitorRef) {
+        const orders = await xtLiquidityBotMonitorRef.getOpenOrders(credentials.apiKey, credentials.apiSecret, symbol);
+        res.json({ code: '0', msg: 'Success', data: orders });
+      } else {
+        res.json({ code: '0', msg: 'Success', data: [] });
+      }
+    } catch (error) {
+      console.error('Error fetching open orders:', error);
+      res.status(500).json({ code: '-1', msg: 'Failed to fetch open orders', data: null });
+    }
+  });
+
+  // DELETE /api/xt-user/liquidity-bot/cancel-order/:orderId - Cancel single order
+  app.delete('/api/xt-user/liquidity-bot/cancel-order/:orderId', verifyXtToken, async (req, res) => {
+    try {
+      const orderId = req.params.orderId;
+      const credentials = await getXtUserCredentials(db, req.xtUser.id);
+      if (!credentials) {
+        return res.status(401).json({ code: '-1', msg: 'XT credentials not found', data: null });
+      }
+      if (xtLiquidityBotMonitorRef) {
+        const success = await xtLiquidityBotMonitorRef.cancelOrder(credentials.apiKey, credentials.apiSecret, orderId);
+        if (success) {
+          console.log(`🗑️ Cancelled order: ${orderId}`);
+          res.json({ code: '0', msg: 'Order cancelled', data: { orderId } });
+        } else {
+          res.status(400).json({ code: '-1', msg: 'Failed to cancel order', data: null });
+        }
+      } else {
+        res.status(500).json({ code: '-1', msg: 'Liquidity bot monitor not available', data: null });
+      }
+    } catch (error) {
+      console.error('Error cancelling order:', error);
+      res.status(500).json({ code: '-1', msg: 'Failed to cancel order', data: null });
+    }
+  });
+
+  // POST /api/xt-user/liquidity-bot/cancel-batch - Cancel multiple orders by IDs
+  app.post('/api/xt-user/liquidity-bot/cancel-batch', verifyXtToken, async (req, res) => {
+    try {
+      const { orderIds } = req.body;
+      if (!orderIds || !Array.isArray(orderIds) || orderIds.length === 0) {
+        return res.status(400).json({ code: '-1', msg: 'orderIds array is required', data: null });
+      }
+      const credentials = await getXtUserCredentials(db, req.xtUser.id);
+      if (!credentials) {
+        return res.status(401).json({ code: '-1', msg: 'XT credentials not found', data: null });
+      }
+      if (xtLiquidityBotMonitorRef) {
+        const result = await xtLiquidityBotMonitorRef.cancelBatchOrders(credentials.apiKey, credentials.apiSecret, orderIds);
+        if (result.success) {
+          console.log(`🗑️ Batch cancelled ${orderIds.length} orders`);
+          res.json({ code: '0', msg: `Cancelled ${orderIds.length} orders`, data: result });
+        } else {
+          res.status(400).json({ code: '-1', msg: result.error || 'Failed to cancel orders', data: null });
+        }
+      } else {
+        res.status(500).json({ code: '-1', msg: 'Liquidity bot monitor not available', data: null });
+      }
+    } catch (error) {
+      console.error('Error batch cancelling orders:', error);
+      res.status(500).json({ code: '-1', msg: 'Failed to cancel orders', data: null });
+    }
+  });
+
   // DELETE /api/xt-user/liquidity-bot/cancel-all-orders - Cancel ALL open orders for symbol
   app.delete('/api/xt-user/liquidity-bot/cancel-all-orders', verifyXtToken, async (req, res) => {
     try {
