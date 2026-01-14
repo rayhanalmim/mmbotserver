@@ -28,8 +28,8 @@ async function deleteAllXtUsers() {
     await client.connect();
     console.log('✅ Connected to MongoDB\n');
     
-    // Get the default database from the connection (MongoDB will use the database specified in the URI)
-    const db = client.db();
+    // Explicitly specify the database name (same as in index.js)
+    const db = client.db('mmbot');
     const collection = db.collection(COLLECTION_NAME);
     
     // Count existing documents
