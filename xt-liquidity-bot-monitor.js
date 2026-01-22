@@ -226,10 +226,17 @@ class XtLiquidityBotMonitor {
   // Get user's open orders
   async getOpenOrders(apiKey, apiSecret, symbol = 'gcb_usdt') {
     try {
-      const data = await this.makeXtRequest(apiKey, apiSecret, 'GET', '/v4/open-order', `symbol=${symbol}&bizType=SPOT`);
+      // XT API uses lowercase symbol format (e.g., gcb_usdt)
+      const lowerSymbol = symbol.toLowerCase();
+      const data = await this.makeXtRequest(apiKey, apiSecret, 'GET', '/v4/open-order', `symbol=${lowerSymbol}&bizType=SPOT`);
+      
       if (data.rc === 0) {
-        return data.result || [];
+        const orders = data.result || [];
+        this.log('info', `📋 API returned ${orders.length} open orders for ${lowerSymbol}`);
+        return orders;
       }
+      
+      this.log('warning', `Open orders API returned rc=${data.rc}, mc=${data.mc}`);
       return [];
     } catch (error) {
       this.log('error', `Failed to fetch open orders: ${error.message}`);
@@ -393,8 +400,13 @@ class XtLiquidityBotMonitor {
         return { success: false, error: 'Could not fetch balance' };
       }
 
+      // Get existing orders to avoid duplicates
+      const myOpenOrders = await this.getOpenOrders(credentials.apiKey, credentials.apiSecret, symbol);
+      const myBuyOrders = myOpenOrders.filter(o => o.side?.toUpperCase() === 'BUY');
+      const mySellOrders = myOpenOrders.filter(o => o.side?.toUpperCase() === 'SELL');
+
       // Generate and place orders
-      const neededOrders = this.generateNeededOrders(analysis, tempBot, symbolInfo);
+      const neededOrders = this.generateNeededOrders(analysis, tempBot, symbolInfo, myBuyOrders, mySellOrders);
       
       let ordersPlaced = 0;
       let ordersFailed = 0;
@@ -572,87 +584,363 @@ class XtLiquidityBotMonitor {
 
   /**
    * Generate orders needed to fulfill liquidity requirements
+   * Properly calculates depth needed and places orders to meet targets
    */
-  generateNeededOrders(analysis, config, symbolInfo) {
+  generateNeededOrders(analysis, config, symbolInfo, myBuyOrders = [], mySellOrders = []) {
     const orders = { buys: [], sells: [] };
     const midPrice = analysis.midPrice;
-    const scale = config.scaleFactor || 1;
     
     // Get precision from symbol info
     const pricePrecision = symbolInfo?.pricePrecision || 6;
     const qtyPrecision = symbolInfo?.quantityPrecision || 2;
     
-    const minDepth2Pct = (config.minDepth2Percent || 500) * scale;
-    const minDepthTop20 = (config.minDepthTop20 || 1000) * scale;
+    // Config values
+    const targetDepth2Pct = config.minDepth2Percent || 500;  // Target depth within ±2%
     const minOrderCount = config.minOrderCount || 30;
-    const orderSize = (config.orderSizeUsdt || 20) * scale;
-    const maxGap = config.maxOrderGap || 1;
-
-    // Helper to format price
+    
+    // Helper functions
     const formatPrice = (price) => parseFloat(price.toFixed(pricePrecision));
-    const formatQty = (qty) => parseFloat(qty.toFixed(qtyPrecision));
+    const formatQty = (qty) => Math.max(parseFloat(qty.toFixed(qtyPrecision)), 0.01);
 
-    // Calculate how many more orders needed
-    const buyOrdersNeeded = Math.max(0, minOrderCount - analysis.metrics.buyOrderCount);
-    const sellOrdersNeeded = Math.max(0, minOrderCount - analysis.metrics.sellOrderCount);
+    // Extract prices and track existing order prices to avoid duplicates
+    const myBuyPrices = myBuyOrders.map(o => parseFloat(o.price || 0));
+    const mySellPrices = mySellOrders.map(o => parseFloat(o.price || 0));
+    const existingBuyPrices = new Set(myBuyPrices.map(p => formatPrice(p).toString()));
+    const existingSellPrices = new Set(mySellPrices.map(p => formatPrice(p).toString()));
 
-    // Calculate depth shortfall
-    const buyDepthNeeded = Math.max(0, minDepth2Pct - analysis.metrics.buyDepth2Pct);
-    const sellDepthNeeded = Math.max(0, minDepth2Pct - analysis.metrics.sellDepth2Pct);
+    // ===== ANALYZE CURRENT MARKET =====
+    // Current total market depth (includes ALL orders)
+    const totalBuyDepth = analysis.metrics?.buyDepth2Pct || 0;
+    const totalSellDepth = analysis.metrics?.sellDepth2Pct || 0;
+    
+    // Calculate OUR current depth contribution in ±2% zone
+    const criticalBuyZoneMin = midPrice * 0.98;
+    const criticalSellZoneMax = midPrice * 1.02;
+    
+    // Calculate actual depth from our orders in ±2% zone
+    const myBuyDepth = myBuyOrders
+      .filter(o => {
+        const price = parseFloat(o.price || 0);
+        return price >= criticalBuyZoneMin && price < midPrice;
+      })
+      .reduce((sum, o) => {
+        const price = parseFloat(o.price || 0);
+        const qty = parseFloat(o.origQty || 0);
+        return sum + (price * qty);
+      }, 0);
+    
+    const mySellDepth = mySellOrders
+      .filter(o => {
+        const price = parseFloat(o.price || 0);
+        return price > midPrice && price <= criticalSellZoneMax;
+      })
+      .reduce((sum, o) => {
+        const price = parseFloat(o.price || 0);
+        const qty = parseFloat(o.origQty || 0);
+        return sum + (price * qty);
+      }, 0);
+    
+    // Calculate how much MORE depth WE need to add to reach target
+    // Target is what WE should contribute, not total market
+    const neededBuyDepth = Math.max(0, targetDepth2Pct - myBuyDepth);
+    const neededSellDepth = Math.max(0, targetDepth2Pct - mySellDepth);
+    
+    // Calculate how many MORE orders we need
+    const existingBuyCount = myBuyPrices.length;
+    const existingSellCount = mySellPrices.length;
+    const neededBuyOrders = Math.max(0, minOrderCount - existingBuyCount);
+    const neededSellOrders = Math.max(0, minOrderCount - existingSellCount);
 
-    // Generate buy orders to fill gaps and meet requirements
-    if (buyOrdersNeeded > 0 || buyDepthNeeded > 0 || !analysis.metrics.buyGapsOk) {
-      const existingBuyPrices = new Set(analysis.buyOrders.map(b => formatPrice(b.price)));
-      let currentPrice = midPrice * 0.999; // Start just below mid
-      let ordersAdded = 0;
-      let depthAdded = 0;
-      const maxOrders = Math.max(buyOrdersNeeded, 30);
+    // Calculate minimum budget required
+    const minBudgetNeeded = {
+      buy: neededBuyDepth,
+      sell: neededSellDepth / midPrice, // Convert USDT value to GCB quantity
+      total: neededBuyDepth + neededSellDepth
+    };
 
-      while ((ordersAdded < maxOrders || depthAdded < buyDepthNeeded) && currentPrice > midPrice * 0.90) {
+    this.log('info', `📊 Total Market: Buy $${totalBuyDepth.toFixed(2)}, Sell $${totalSellDepth.toFixed(2)}`);
+    this.log('info', `📊 My Depth: Buy $${myBuyDepth.toFixed(2)}/${targetDepth2Pct}, Sell $${mySellDepth.toFixed(2)}/${targetDepth2Pct}`);
+    this.log('info', `📊 Orders: Have ${existingBuyCount}B/${existingSellCount}S, Need ${neededBuyOrders}B/${neededSellOrders}S more`);
+    this.log('info', `💰 Need to add: $${neededBuyDepth.toFixed(2)} USDT for buys, $${neededSellDepth.toFixed(2)} USDT for sells`);
+
+    // ===== GENERATE BUY ORDERS =====
+    if (neededBuyOrders > 0 || neededBuyDepth > 0) {
+      // Priority 1: Fill ±2% zone first for depth requirement
+      // Maintain minimum 0.5% spread - don't place orders closer than 0.5% from mid
+      const criticalZoneMin = midPrice * 0.98;
+      const criticalZoneMax = midPrice * 0.995; // 0.5% below mid-price
+      
+      // Calculate price levels in critical zone
+      const priceStep = (criticalZoneMax - criticalZoneMin) / Math.max(neededBuyOrders, 10);
+      const buyPriceLevels = [];
+      
+      // Start from highest price (closest to mid) and work down
+      let currentPrice = criticalZoneMax;
+      while (buyPriceLevels.length < neededBuyOrders && currentPrice >= criticalZoneMin) {
         const price = formatPrice(currentPrice);
-        
-        // Don't add if price already exists
-        if (!existingBuyPrices.has(price)) {
-          const quantity = formatQty(orderSize / price);
-          if (quantity > 0) {
-            orders.buys.push({ price: price.toString(), quantity: quantity.toString() });
-            depthAdded += orderSize;
-            ordersAdded++;
-          }
+        const priceStr = price.toString();
+        if (!existingBuyPrices.has(priceStr) && price < midPrice) {
+          buyPriceLevels.push(price);
+          existingBuyPrices.add(priceStr);
         }
+        currentPrice -= priceStep;
+      }
+      
+      // If we need more orders, extend beyond ±2% zone
+      if (buyPriceLevels.length < neededBuyOrders) {
+        currentPrice = criticalZoneMin - 0.0001;
+        const extendedMin = midPrice * 0.90;
+        while (buyPriceLevels.length < neededBuyOrders && currentPrice >= extendedMin) {
+          const price = formatPrice(currentPrice);
+          const priceStr = price.toString();
+          if (!existingBuyPrices.has(priceStr)) {
+            buyPriceLevels.push(price);
+            existingBuyPrices.add(priceStr);
+          }
+          currentPrice *= 0.995; // Step down by 0.5%
+        }
+      }
+      
+      // Distribute the needed depth across orders
+      // 80% of depth in first 20% of orders (closest to mid)
+      // 20% of depth in remaining 80% of orders
+      if (buyPriceLevels.length > 0) {
+        const totalDepthToPlace = neededBuyDepth > 0 ? neededBuyDepth : Math.min(targetDepth2Pct * 0.5, 50);
+        const criticalOrderCount = Math.ceil(buyPriceLevels.length * 0.2);
         
-        // Step down by ~0.5% to ensure gaps < 1%
-        currentPrice = currentPrice * (1 - (maxGap / 200));
+        buyPriceLevels.forEach((price, idx) => {
+          let orderValue;
+          if (idx < criticalOrderCount) {
+            // Critical orders get 80% of depth
+            orderValue = (totalDepthToPlace * 0.8) / criticalOrderCount;
+          } else {
+            // Remaining orders share 20% of depth
+            orderValue = (totalDepthToPlace * 0.2) / Math.max(1, buyPriceLevels.length - criticalOrderCount);
+          }
+          
+          const qty = formatQty(orderValue / price);
+          if (qty >= 0.01) {
+            orders.buys.push({ price: price.toString(), quantity: qty.toString() });
+          }
+        });
       }
     }
 
-    // Generate sell orders to fill gaps and meet requirements
-    if (sellOrdersNeeded > 0 || sellDepthNeeded > 0 || !analysis.metrics.sellGapsOk) {
-      const existingSellPrices = new Set(analysis.sellOrders.map(a => formatPrice(a.price)));
-      let currentPrice = midPrice * 1.001; // Start just above mid
-      let ordersAdded = 0;
-      let depthAdded = 0;
-      const maxOrders = Math.max(sellOrdersNeeded, 30);
-
-      while ((ordersAdded < maxOrders || depthAdded < sellDepthNeeded) && currentPrice < midPrice * 1.10) {
+    // ===== GENERATE SELL ORDERS =====
+    if (neededSellOrders > 0 || neededSellDepth > 0) {
+      // Priority 1: Fill ±2% zone first for depth requirement
+      // Maintain minimum 0.5% spread - don't place orders closer than 0.5% from mid
+      const criticalZoneMin = midPrice * 1.005; // 0.5% above mid-price
+      const criticalZoneMax = midPrice * 1.02;
+      
+      // Calculate price levels in critical zone
+      const priceStep = (criticalZoneMax - criticalZoneMin) / Math.max(neededSellOrders, 10);
+      const sellPriceLevels = [];
+      
+      // Start from lowest price (closest to mid) and work up
+      let currentPrice = criticalZoneMin;
+      while (sellPriceLevels.length < neededSellOrders && currentPrice <= criticalZoneMax) {
         const price = formatPrice(currentPrice);
-        
-        // Don't add if price already exists
-        if (!existingSellPrices.has(price)) {
-          const quantity = formatQty(orderSize / price);
-          if (quantity > 0) {
-            orders.sells.push({ price: price.toString(), quantity: quantity.toString() });
-            depthAdded += orderSize;
-            ordersAdded++;
-          }
+        const priceStr = price.toString();
+        if (!existingSellPrices.has(priceStr) && price > midPrice) {
+          sellPriceLevels.push(price);
+          existingSellPrices.add(priceStr);
         }
+        currentPrice += priceStep;
+      }
+      
+      // If we need more orders, extend beyond ±2% zone
+      if (sellPriceLevels.length < neededSellOrders) {
+        currentPrice = criticalZoneMax + 0.0001;
+        const extendedMax = midPrice * 1.10;
+        while (sellPriceLevels.length < neededSellOrders && currentPrice <= extendedMax) {
+          const price = formatPrice(currentPrice);
+          const priceStr = price.toString();
+          if (!existingSellPrices.has(priceStr)) {
+            sellPriceLevels.push(price);
+            existingSellPrices.add(priceStr);
+          }
+          currentPrice *= 1.005; // Step up by 0.5%
+        }
+      }
+      
+      // Distribute the needed depth across orders
+      if (sellPriceLevels.length > 0) {
+        const totalDepthToPlace = neededSellDepth > 0 ? neededSellDepth : Math.min(targetDepth2Pct * 0.5, 50);
+        const criticalOrderCount = Math.ceil(sellPriceLevels.length * 0.2);
         
-        // Step up by ~0.5% to ensure gaps < 1%
-        currentPrice = currentPrice * (1 + (maxGap / 200));
+        sellPriceLevels.forEach((price, idx) => {
+          let orderValue;
+          if (idx < criticalOrderCount) {
+            // Critical orders get 80% of depth
+            orderValue = (totalDepthToPlace * 0.8) / criticalOrderCount;
+          } else {
+            // Remaining orders share 20% of depth
+            orderValue = (totalDepthToPlace * 0.2) / Math.max(1, sellPriceLevels.length - criticalOrderCount);
+          }
+          
+          const qty = formatQty(orderValue / price);
+          if (qty >= 0.01) {
+            orders.sells.push({ price: price.toString(), quantity: qty.toString() });
+          }
+        });
       }
     }
 
+    // Log summary
+    const totalBuyValue = orders.buys.reduce((sum, o) => sum + parseFloat(o.price) * parseFloat(o.quantity), 0);
+    const totalSellValue = orders.sells.reduce((sum, o) => sum + parseFloat(o.price) * parseFloat(o.quantity), 0);
+    const totalSellQty = orders.sells.reduce((sum, o) => sum + parseFloat(o.quantity), 0);
+    
+    this.log('info', `📊 Generated ${orders.buys.length} buy orders ($${totalBuyValue.toFixed(2)}) and ${orders.sells.length} sell orders (${totalSellQty.toFixed(2)} GCB worth $${totalSellValue.toFixed(2)})`);
+
+    // Store budget requirements for UI
+    orders.budgetRequired = minBudgetNeeded;
+    
     return orders;
+  }
+
+  /**
+   * Shuffle orders to make market look active and avoid bot detection
+   * Randomly cancels 2-5 orders and re-places them at new positions
+   * Direction alternates randomly (high-to-low or low-to-high)
+   */
+  async shuffleOrders(credentials, buyOrders, sellOrders, midPrice, symbolInfo, config) {
+    const pricePrecision = symbolInfo?.pricePrecision || 6;
+    const qtyPrecision = symbolInfo?.quantityPrecision || 2;
+    
+    const formatPrice = (price) => parseFloat(price.toFixed(pricePrecision));
+    const formatQty = (qty) => Math.max(parseFloat(qty.toFixed(qtyPrecision)), 0.01);
+    
+    // Randomly decide how many orders to shuffle (2-4)
+    const shuffleCount = Math.floor(Math.random() * 3) + 2;
+    
+    // Only shuffle sides that have enough orders
+    const canShuffleBuys = buyOrders.length >= shuffleCount;
+    const canShuffleSells = sellOrders.length >= shuffleCount;
+    
+    // Random chance to skip shuffle (20%)
+    if (Math.random() < 0.2) {
+      this.log('info', `🔄 Shuffle skipped this cycle (random cooldown)`);
+      return;
+    }
+    
+    if (!canShuffleBuys && !canShuffleSells) {
+      this.log('info', `🔄 Not enough orders to shuffle`);
+      return;
+    }
+    
+    const ordersToCancel = [];
+    const newOrders = { buys: [], sells: [] };
+    
+    // Get all existing prices to avoid duplicates
+    const existingBuyPrices = new Set(buyOrders.map(o => parseFloat(o.price).toFixed(pricePrecision)));
+    const existingSellPrices = new Set(sellOrders.map(o => parseFloat(o.price).toFixed(pricePrecision)));
+    
+    // Shuffle buy orders - ONLY from top 10 (highest price = closest to mid)
+    if (canShuffleBuys) {
+      // Sort by price descending (highest first = closest to mid-price)
+      const sortedByPrice = [...buyOrders].sort((a, b) => parseFloat(b.price) - parseFloat(a.price));
+      const top10Buys = sortedByPrice.slice(0, 10);
+      
+      // Randomly select 2-3 from top 10 to shuffle
+      const shuffled = [...top10Buys].sort(() => Math.random() - 0.5);
+      const toShuffle = shuffled.slice(0, Math.min(shuffleCount, 3));
+      
+      for (const order of toShuffle) {
+        ordersToCancel.push(order.orderId);
+        existingBuyPrices.delete(parseFloat(order.price).toFixed(pricePrecision));
+      }
+      
+      // Generate new prices - randomly high-to-low or low-to-high
+      const direction = Math.random() > 0.5 ? 1 : -1;
+      const startPrice = direction > 0 ? midPrice * 0.998 : midPrice * 0.96;
+      const step = 0.003 * direction;
+      
+      let currentPrice = startPrice;
+      for (const order of toShuffle) {
+        let attempts = 0;
+        while (attempts < 50) {
+          const newPrice = formatPrice(currentPrice * (1 + (Math.random() - 0.5) * 0.01));
+          const priceStr = newPrice.toFixed(pricePrecision);
+          
+          if (!existingBuyPrices.has(priceStr) && newPrice < midPrice && newPrice > midPrice * 0.90) {
+            const qty = formatQty(parseFloat(order.origQty) * (0.8 + Math.random() * 0.4));
+            newOrders.buys.push({ price: newPrice.toString(), quantity: qty.toString() });
+            existingBuyPrices.add(priceStr);
+            break;
+          }
+          currentPrice = currentPrice * (1 - step);
+          attempts++;
+        }
+      }
+    }
+    
+    // Shuffle sell orders - ONLY from top 10 (lowest price = closest to mid)
+    if (canShuffleSells) {
+      // Sort by price ascending (lowest first = closest to mid-price)
+      const sortedByPrice = [...sellOrders].sort((a, b) => parseFloat(a.price) - parseFloat(b.price));
+      const top10Sells = sortedByPrice.slice(0, 10);
+      
+      // Randomly select 2-3 from top 10 to shuffle
+      const shuffled = [...top10Sells].sort(() => Math.random() - 0.5);
+      const toShuffle = shuffled.slice(0, Math.min(shuffleCount, 3));
+      
+      for (const order of toShuffle) {
+        ordersToCancel.push(order.orderId);
+        existingSellPrices.delete(parseFloat(order.price).toFixed(pricePrecision));
+      }
+      
+      // Generate new prices - randomly high-to-low or low-to-high
+      const direction = Math.random() > 0.5 ? 1 : -1;
+      const startPrice = direction > 0 ? midPrice * 1.002 : midPrice * 1.08;
+      const step = 0.003 * direction;
+      
+      let currentPrice = startPrice;
+      for (const order of toShuffle) {
+        let attempts = 0;
+        while (attempts < 50) {
+          const newPrice = formatPrice(currentPrice * (1 + (Math.random() - 0.5) * 0.01));
+          const priceStr = newPrice.toFixed(pricePrecision);
+          
+          if (!existingSellPrices.has(priceStr) && newPrice > midPrice && newPrice < midPrice * 1.15) {
+            const qty = formatQty(parseFloat(order.origQty) * (0.8 + Math.random() * 0.4));
+            newOrders.sells.push({ price: newPrice.toString(), quantity: qty.toString() });
+            existingSellPrices.add(priceStr);
+            break;
+          }
+          currentPrice = currentPrice * (1 + step);
+          attempts++;
+        }
+      }
+    }
+    
+    if (ordersToCancel.length === 0) {
+      return;
+    }
+    
+    this.log('info', `🔄 Shuffling ${ordersToCancel.length} orders (${newOrders.buys.length}B/${newOrders.sells.length}S) for natural market activity`);
+    
+    // Cancel selected orders
+    await this.cancelBatchOrders(credentials.apiKey, credentials.apiSecret, ordersToCancel);
+    await new Promise(resolve => setTimeout(resolve, 500 + Math.random() * 500)); // Random delay 500-1000ms
+    
+    // Place new orders
+    const allNewOrders = [...newOrders.buys.map(o => ({ ...o, side: 'BUY' })), ...newOrders.sells.map(o => ({ ...o, side: 'SELL' }))];
+    
+    // Randomize order placement sequence
+    allNewOrders.sort(() => Math.random() - 0.5);
+    
+    for (const order of allNewOrders) {
+      try {
+        await this.placeLimitOrder(credentials.apiKey, credentials.apiSecret, config.symbol || 'gcb_usdt', order.side, order.price, order.quantity);
+        await new Promise(resolve => setTimeout(resolve, 200 + Math.random() * 300)); // Random delay between orders
+      } catch (error) {
+        this.log('warning', `Failed to place shuffled order: ${error.message}`);
+      }
+    }
+    
+    this.log('success', `🔄 Shuffle complete: ${allNewOrders.length} orders repositioned`);
   }
 
   async checkAllLiquidityBots() {
@@ -748,7 +1036,19 @@ class XtLiquidityBotMonitor {
                     analysis.metrics.buyGapsOk &&
                     analysis.metrics.sellGapsOk;
 
-      // Update bot status
+      // Get MY open orders first for accurate budget calculation
+      const myOpenOrdersForCalc = await this.getOpenOrders(credentials.apiKey, credentials.apiSecret, symbol);
+      const myBuyOrdersForCalc = myOpenOrdersForCalc.filter(o => o.side?.toUpperCase() === 'BUY');
+      const mySellOrdersForCalc = myOpenOrdersForCalc.filter(o => o.side?.toUpperCase() === 'SELL');
+      
+      // Calculate budget requirements for UI - pass full order objects
+      const tempNeededOrders = this.generateNeededOrders(analysis, freshBot, symbolInfo, myBuyOrdersForCalc, mySellOrdersForCalc);
+      const budgetRequired = tempNeededOrders.budgetRequired || { buy: 0, sell: 0, total: 0 };
+      
+      // Get balance for status update
+      const balancesForStatus = await this.getAccountBalance(credentials.apiKey, credentials.apiSecret);
+      
+      // Update bot status with budget info
       await this.db.collection('xt_liquidity_bots').updateOne(
         { _id: bot._id },
         { 
@@ -761,34 +1061,114 @@ class XtLiquidityBotMonitor {
             lastBuyOrderCount: analysis.metrics.buyOrderCount,
             lastSellOrderCount: analysis.metrics.sellOrderCount,
             liquidityOk: allOk,
+            budgetRequired: budgetRequired,
+            availableBalance: { 
+              usdt: balancesForStatus?.usdt?.availableAmount || 0, 
+              gcb: balancesForStatus?.gcb?.availableAmount || 0 
+            },
+            myBuyOrderCount: myBuyOrdersForCalc.length,
+            mySellOrderCount: mySellOrdersForCalc.length,
             updatedAt: new Date()
           } 
         }
       );
 
-      if (allOk) {
-        this.log('success', `[${bot.name}] ✅ All liquidity requirements met`);
-        return;
-      }
+      // Fetch MY open orders to update counts in DB
+      const myOrdersForCount = await this.getOpenOrders(credentials.apiKey, credentials.apiSecret, symbol);
+      const myBuys = myOrdersForCount.filter(o => o.side?.toUpperCase() === 'BUY').length;
+      const mySells = myOrdersForCount.filter(o => o.side?.toUpperCase() === 'SELL').length;
+      
+      await this.db.collection('xt_liquidity_bots').updateOne(
+        { _id: bot._id },
+        { $set: { myBuyOrderCount: myBuys, mySellOrderCount: mySells } }
+      );
 
       // Only place orders if autoManage is enabled
       if (!freshBot.autoManage) {
-        this.log('info', `[${bot.name}] ⚠️ Liquidity issues detected but autoManage is disabled`);
-        
-        // Log issues
-        if (!analysis.metrics.spreadOk) {
-          this.log('warning', `[${bot.name}] Spread ${analysis.metrics.spread.toFixed(3)}% exceeds ${freshBot.maxSpread || 1}%`);
-        }
-        if (!analysis.metrics.depth2PctOk) {
-          this.log('warning', `[${bot.name}] Depth ±2% insufficient - Buy: $${analysis.metrics.buyDepth2Pct.toFixed(2)}, Sell: $${analysis.metrics.sellDepth2Pct.toFixed(2)}`);
-        }
-        if (!analysis.metrics.orderCountOk) {
-          this.log('warning', `[${bot.name}] Order count insufficient - Buy: ${analysis.metrics.buyOrderCount}, Sell: ${analysis.metrics.sellOrderCount}`);
-        }
-        if (!analysis.metrics.buyGapsOk || !analysis.metrics.sellGapsOk) {
-          this.log('warning', `[${bot.name}] Gap issues in top 20: ${JSON.stringify(analysis.metrics.gapIssues)}`);
+        if (!allOk) {
+          this.log('info', `[${bot.name}] ⚠️ Liquidity issues detected but autoManage is disabled`);
+          if (!analysis.metrics.spreadOk) {
+            this.log('warning', `[${bot.name}] Spread ${analysis.metrics.spread.toFixed(3)}% exceeds ${freshBot.maxSpread || 1}%`);
+          }
+          if (!analysis.metrics.depth2PctOk) {
+            this.log('warning', `[${bot.name}] Depth ±2% insufficient - Buy: $${analysis.metrics.buyDepth2Pct.toFixed(2)}, Sell: $${analysis.metrics.sellDepth2Pct.toFixed(2)}`);
+          }
+          if (!analysis.metrics.orderCountOk) {
+            this.log('warning', `[${bot.name}] Order count insufficient - Buy: ${analysis.metrics.buyOrderCount}, Sell: ${analysis.metrics.sellOrderCount}`);
+          }
+        } else {
+          this.log('success', `[${bot.name}] ✅ All liquidity requirements met (autoManage disabled)`);
         }
         return;
+      }
+
+      // Get MY open orders to check if we need to place more
+      const myOpenOrders = await this.getOpenOrders(credentials.apiKey, credentials.apiSecret, symbol);
+      // XT API returns side in uppercase, but check both just in case
+      const myBuyOrders = myOpenOrders.filter(o => o.side?.toUpperCase() === 'BUY');
+      const mySellOrders = myOpenOrders.filter(o => o.side?.toUpperCase() === 'SELL');
+      
+      this.log('info', `[${bot.name}] 🔍 Found ${myOpenOrders.length} total open orders (${myBuyOrders.length}B/${mySellOrders.length}S)`);
+      
+      const minOrderCount = freshBot.minOrderCount || 30;
+      
+      // Only cancel orders that are EXTREMELY stale (>25% away from mid-price)
+      // Don't cancel based on order size - small orders are fine for outer zones
+      const ordersToCancel = [];
+      const buyPriceRange = { min: midPrice * 0.75, max: midPrice * 1.02 };  // 25% below to 2% above
+      const sellPriceRange = { min: midPrice * 0.98, max: midPrice * 1.25 }; // 2% below to 25% above
+
+      for (const order of myBuyOrders) {
+        const price = parseFloat(order.price);
+        if (price < buyPriceRange.min || price > buyPriceRange.max) {
+          ordersToCancel.push(order.orderId);
+        }
+      }
+
+      for (const order of mySellOrders) {
+        const price = parseFloat(order.price);
+        if (price < sellPriceRange.min || price > sellPriceRange.max) {
+          ordersToCancel.push(order.orderId);
+        }
+      }
+
+      // Cancel stale orders if any found
+      if (ordersToCancel.length > 0) {
+        this.log('info', `[${bot.name}] 🗑️ Cancelling ${ordersToCancel.length} stale orders (>25% from mid-price)`);
+        await this.cancelBatchOrders(credentials.apiKey, credentials.apiSecret, ordersToCancel);
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+
+      // Re-fetch orders after cancellation
+      const updatedOpenOrders = ordersToCancel.length > 0 
+        ? await this.getOpenOrders(credentials.apiKey, credentials.apiSecret, symbol)
+        : myOpenOrders;
+      const updatedBuyOrders = updatedOpenOrders.filter(o => o.side?.toUpperCase() === 'BUY');
+      const updatedSellOrders = updatedOpenOrders.filter(o => o.side?.toUpperCase() === 'SELL');
+
+      // Check if MARKET already meets requirements (not just our orders)
+      const targetDepth2Pct = freshBot.minDepth2Percent || 500;
+      const marketBuyDepthOk = analysis.metrics.buyDepth2Pct >= targetDepth2Pct;
+      const marketSellDepthOk = analysis.metrics.sellDepth2Pct >= targetDepth2Pct;
+      const marketBuyCountOk = analysis.metrics.buyOrderCount >= minOrderCount;
+      const marketSellCountOk = analysis.metrics.sellOrderCount >= minOrderCount;
+      
+      // If MARKET already meets all requirements, don't place any orders
+      if (allOk) {
+        this.log('success', `[${bot.name}] ✅ Market already meets all requirements. My orders: ${updatedBuyOrders.length}B/${updatedSellOrders.length}S`);
+        return;
+      }
+      
+      // Check which side needs help
+      const needMoreBuys = !marketBuyDepthOk || !marketBuyCountOk;
+      const needMoreSells = !marketSellDepthOk || !marketSellCountOk;
+      
+      // Log what needs improvement
+      if (needMoreBuys) {
+        this.log('info', `[${bot.name}] 📋 Buy side needs help - Depth: $${analysis.metrics.buyDepth2Pct.toFixed(2)}/${targetDepth2Pct}, Count: ${analysis.metrics.buyOrderCount}/${minOrderCount}`);
+      }
+      if (needMoreSells) {
+        this.log('info', `[${bot.name}] 📋 Sell side needs help - Depth: $${analysis.metrics.sellDepth2Pct.toFixed(2)}/${targetDepth2Pct}, Count: ${analysis.metrics.sellOrderCount}/${minOrderCount}`);
       }
 
       // Check balance before placing orders
@@ -801,28 +1181,97 @@ class XtLiquidityBotMonitor {
       const availableUsdt = balances.usdt?.availableAmount || 0;
       const availableGcb = balances.gcb?.availableAmount || 0;
 
-      // Generate needed orders
-      const neededOrders = this.generateNeededOrders(analysis, freshBot, symbolInfo);
+      // Generate needed orders ONLY for sides that need help
+      this.log('info', `[${bot.name}] 📋 Existing orders - Buy: ${updatedBuyOrders.length}, Sell: ${updatedSellOrders.length}`);
+      const neededOrders = this.generateNeededOrders(analysis, freshBot, symbolInfo, updatedBuyOrders, updatedSellOrders);
+      
+      // Filter out orders for sides that already meet requirements
+      if (marketBuyDepthOk && marketBuyCountOk) {
+        this.log('info', `[${bot.name}] ✅ Buy side already sufficient - skipping buy orders`);
+        neededOrders.buys = [];
+      }
+      if (marketSellDepthOk && marketSellCountOk) {
+        this.log('info', `[${bot.name}] ✅ Sell side already sufficient - skipping sell orders`);
+        neededOrders.sells = [];
+      }
       
       const totalBuyUsdt = neededOrders.buys.reduce((sum, o) => sum + parseFloat(o.price) * parseFloat(o.quantity), 0);
       const totalSellGcb = neededOrders.sells.reduce((sum, o) => sum + parseFloat(o.quantity), 0);
 
-      this.log('info', `[${bot.name}] 📝 Need ${neededOrders.buys.length} buy orders ($${totalBuyUsdt.toFixed(2)} USDT) and ${neededOrders.sells.length} sell orders (${totalSellGcb.toFixed(2)} GCB)`);
-
-      // Check if we have enough balance
-      if (totalBuyUsdt > availableUsdt) {
-        this.log('warning', `[${bot.name}] Insufficient USDT: need $${totalBuyUsdt.toFixed(2)}, have $${availableUsdt.toFixed(2)}`);
-        // Reduce buy orders to fit budget
-        const ratio = availableUsdt / totalBuyUsdt;
-        neededOrders.buys = neededOrders.buys.slice(0, Math.floor(neededOrders.buys.length * ratio));
+      this.log('info', `[${bot.name}] 📝 Will place ${neededOrders.buys.length} buy orders ($${totalBuyUsdt.toFixed(2)} USDT) and ${neededOrders.sells.length} sell orders (${totalSellGcb.toFixed(2)} GCB)`);
+      
+      // If no orders needed, we're done
+      if (neededOrders.buys.length === 0 && neededOrders.sells.length === 0) {
+        this.log('success', `[${bot.name}] ✅ No orders needed - market is sufficient`);
+        return;
       }
 
-      if (totalSellGcb > availableGcb) {
-        this.log('warning', `[${bot.name}] Insufficient GCB: need ${totalSellGcb.toFixed(2)}, have ${availableGcb.toFixed(2)}`);
-        // Reduce sell orders to fit budget
-        const ratio = availableGcb / totalSellGcb;
-        neededOrders.sells = neededOrders.sells.slice(0, Math.floor(neededOrders.sells.length * ratio));
+      // ALWAYS use available balance to improve depth, even if partial
+      if (neededOrders.buys.length > 0) {
+        if (totalBuyUsdt > availableUsdt) {
+          if (availableUsdt >= 0.5) { // At least $0.50 to place orders
+            this.log('info', `[${bot.name}] 💰 Using available $${availableUsdt.toFixed(2)} USDT (need $${totalBuyUsdt.toFixed(2)})`);
+            // Prioritize orders closest to mid-price
+            let budgetUsed = 0;
+            const adjustedBuys = [];
+            
+            for (const order of neededOrders.buys) {
+              const orderValue = parseFloat(order.price) * parseFloat(order.quantity);
+              if (budgetUsed + orderValue <= availableUsdt) {
+                adjustedBuys.push(order);
+                budgetUsed += orderValue;
+              } else if (availableUsdt - budgetUsed >= 0.5) {
+                // Place smaller order with remaining budget
+                const remainingBudget = availableUsdt - budgetUsed;
+                const newQty = formatQty(remainingBudget / parseFloat(order.price));
+                if (newQty >= 0.01) {
+                  adjustedBuys.push({ price: order.price, quantity: newQty.toString() });
+                  budgetUsed += remainingBudget;
+                }
+                break;
+              }
+            }
+            neededOrders.buys = adjustedBuys;
+          } else {
+            this.log('warning', `[${bot.name}] Insufficient USDT: have $${availableUsdt.toFixed(2)}, need at least $0.50`);
+            neededOrders.buys = [];
+          }
+        }
       }
+
+      if (neededOrders.sells.length > 0) {
+        if (totalSellGcb > availableGcb) {
+          if (availableGcb >= 0.5) { // At least 0.5 GCB to place orders
+            this.log('info', `[${bot.name}] 💰 Using available ${availableGcb.toFixed(2)} GCB (need ${totalSellGcb.toFixed(2)})`);
+            // Prioritize orders closest to mid-price
+            let gcbUsed = 0;
+            const adjustedSells = [];
+            
+            for (const order of neededOrders.sells) {
+              const orderQty = parseFloat(order.quantity);
+              if (gcbUsed + orderQty <= availableGcb) {
+                adjustedSells.push(order);
+                gcbUsed += orderQty;
+              } else if (availableGcb - gcbUsed >= 0.5) {
+                // Place smaller order with remaining GCB
+                const remainingGcb = availableGcb - gcbUsed;
+                if (remainingGcb >= 0.01) {
+                  adjustedSells.push({ price: order.price, quantity: remainingGcb.toFixed(2) });
+                  gcbUsed += remainingGcb;
+                }
+                break;
+              }
+            }
+            neededOrders.sells = adjustedSells;
+          } else {
+            this.log('warning', `[${bot.name}] Insufficient GCB: have ${availableGcb.toFixed(2)}, need at least 0.5`);
+            neededOrders.sells = [];
+          }
+        }
+      }
+      
+      // Helper function for formatting quantities
+      const formatQty = (qty) => Math.max(parseFloat(qty.toFixed(2)), 0.01);
 
       // Place orders in batches
       let ordersPlaced = 0;

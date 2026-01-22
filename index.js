@@ -12,7 +12,7 @@ import PriceKeeperBotMonitor from './price-keeper-bot-monitor.js';
 import telegramService from './telegram-service.js';
 import { setupMexcRoutes, setupMexcMMBotRoutes } from './mexc-routes.js';
 import MexcMMBotMonitor from './mexc-mm-bot-monitor.js';
-import { setupMexcUserRoutes } from './mexc-user-routes.js';
+import { setupMexcUserRoutes, verifyMexcToken } from './mexc-user-routes.js';
 import { setupMexcUserApiRoutes, setUserBotMonitor } from './mexc-user-api-routes.js';
 import MexcUserBotMonitor from './mexc-user-bot-monitor.js';
 import { setupXtRoutes } from './xt-routes.js';
@@ -21,6 +21,9 @@ import { setupXtUserApiRoutes, setXtUserBotMonitor } from './xt-user-api-routes.
 import XtUserBotMonitor from './xt-user-bot-monitor.js';
 import { setupXtLiquidityBotRoutes, setXtLiquidityBotMonitor } from './xt-liquidity-bot-routes.js';
 import XtLiquidityBotMonitor from './xt-liquidity-bot-monitor.js';
+import { setupInstallmentRoutes } from './installment-routes.js';
+import { setupInstallmentQueueRoutes } from './installment-queue-routes.js';
+import { createQueueWorker } from './installment-queue-worker.js';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -4033,42 +4036,42 @@ app.put('/api/bot/price-keeper/:id', async (req, res) => {
 // ============================================
 connectToMongoDB().then(async () => {
   // Initialize Bot Monitor
-  botMonitor = new BotMonitor(db, {
-    openApiBase: GCBEX_OPEN_API_BASE,
-    marketPollInterval: 10000, // 10 seconds
-    balancePollInterval: 30000, // 30 seconds
-    conditionCooldown: 60000 // 1 minute
-  });
-  console.log('✅ Bot Monitor initialized');
+  // botMonitor = new BotMonitor(db, {
+  //   openApiBase: GCBEX_OPEN_API_BASE,
+  //   marketPollInterval: 10000, // 10 seconds
+  //   balancePollInterval: 30000, // 30 seconds
+  //   conditionCooldown: 60000 // 1 minute
+  // });
+  // console.log('✅ Bot Monitor initialized');
 
   // Initialize Scheduled Bot Monitor
-  scheduledBotMonitor = new ScheduledBotMonitor(db, {
-    openApiBase: GCBEX_OPEN_API_BASE,
-    checkInterval: 60000 // Check every 1 minute
-  });
-  console.log('✅ Scheduled Bot Monitor initialized');
+  // scheduledBotMonitor = new ScheduledBotMonitor(db, {
+  //   openApiBase: GCBEX_OPEN_API_BASE,
+  //   checkInterval: 60000 // Check every 1 minute
+  // });
+  // console.log('✅ Scheduled Bot Monitor initialized');
 
   // Initialize Market Maker Bot Monitor
-  marketMakerBotMonitor = new MarketMakerBotMonitor(db, {
-    openApiBase: GCBEX_OPEN_API_BASE,
-    checkInterval: 30000 // Check every 30 seconds
-  });
-  console.log('✅ Market Maker Bot Monitor initialized');
+  // marketMakerBotMonitor = new MarketMakerBotMonitor(db, {
+  //   openApiBase: GCBEX_OPEN_API_BASE,
+  //   checkInterval: 30000 // Check every 30 seconds
+  // });
+  // console.log('✅ Market Maker Bot Monitor initialized');
 
-  // Initialize Stabilizer Bot Monitor
-  stabilizerBotMonitor = new StabilizerBotMonitor(db, {
-    openApiBase: GCBEX_OPEN_API_BASE,
-    checkInterval: 5000 // Check every 5 seconds
-  });
-  console.log('✅ Stabilizer Bot Monitor initialized');
+  // // Initialize Stabilizer Bot Monitor
+  // stabilizerBotMonitor = new StabilizerBotMonitor(db, {
+  //   openApiBase: GCBEX_OPEN_API_BASE,
+  //   checkInterval: 5000 // Check every 5 seconds
+  // });
+  // console.log('✅ Stabilizer Bot Monitor initialized');
 
   // Initialize Buy Wall Bot Monitor
-  buyWallBotMonitor = new BuyWallBotMonitor(db);
-  console.log('✅ Buy Wall Bot Monitor initialized');
+  // buyWallBotMonitor = new BuyWallBotMonitor(db);
+  // console.log('✅ Buy Wall Bot Monitor initialized');
 
-  // Initialize Price Keeper Bot Monitor
-  priceKeeperBotMonitor = new PriceKeeperBotMonitor(db);
-  console.log('✅ Price Keeper Bot Monitor initialized');
+  // // Initialize Price Keeper Bot Monitor
+  // priceKeeperBotMonitor = new PriceKeeperBotMonitor(db);
+  // console.log('✅ Price Keeper Bot Monitor initialized');
 
   // Initialize MEXC MM Bot Monitor
   mexcMMBotMonitor = new MexcMMBotMonitor(db);
@@ -4135,6 +4138,22 @@ connectToMongoDB().then(async () => {
     console.log('✅ XT Liquidity Bot Monitor started');
   } catch (error) {
     console.error('⚠️ Error starting XT Liquidity Bot Monitor:', error.message);
+  }
+
+  // Initialize Installment Routes
+  setupInstallmentRoutes(app, db, verifyMexcToken);
+  console.log('✅ Installment routes initialized');
+
+  // Initialize Installment Queue Routes and Worker
+  setupInstallmentQueueRoutes(app, db, verifyMexcToken);
+  console.log('✅ Installment queue routes initialized');
+  
+  // Start queue worker (background process for delayed transfers)
+  try {
+    await createQueueWorker(db);
+    console.log('✅ Installment queue worker started');
+  } catch (error) {
+    console.error('⚠️ Error starting queue worker:', error.message);
   }
 
   // Auto-start conditional bot if any user has botEnabled: true

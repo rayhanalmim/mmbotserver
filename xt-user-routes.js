@@ -65,7 +65,13 @@ function buildSignatureMessage(method, path, queryString, bodyJson, headers) {
   // Build Y part (request data)
   let Y = `#${method.toUpperCase()}#${path}`;
   if (queryString) {
-    Y += `#${queryString}`;
+    // Sort query params alphabetically by key as per XT API docs
+    const sortedQuery = queryString.split('&')
+      .map(param => param.split('='))
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([k, v]) => `${k}=${v}`)
+      .join('&');
+    Y += `#${sortedQuery}`;
   }
   if (bodyJson) {
     Y += `#${bodyJson}`;

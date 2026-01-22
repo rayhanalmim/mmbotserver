@@ -21,13 +21,12 @@ export function setupXtLiquidityBotRoutes(app, db) {
       const {
         name,
         symbol,
-        scaleFactor,        // e.g., 0.01 means 1000 USDT = 10 USDT
+        totalBudget,        // Direct budget in USDT (e.g., 20, 100, 500)
         minDepth2Percent,   // Min depth within ±2% of mid-price (default 500 USDT)
         minDepthTop20,      // Min cumulative depth for top 20 (default 1000 USDT)
         minOrderCount,      // Min order count each side (default 30)
         maxSpread,          // Max spread % (default 1)
         maxOrderGap,        // Max gap between orders % (default 1)
-        orderSizeUsdt,      // Size of each order in USDT (default 20)
         checkIntervalSeconds, // How often to check (default 30)
         autoManage,         // Auto place orders to fix liquidity (default false)
         telegramEnabled
@@ -49,14 +48,12 @@ export function setupXtLiquidityBotRoutes(app, db) {
         symbol: symbol || 'gcb_usdt',
         botType: 'LIQUIDITY',
         
-        // Liquidity config with defaults
-        scaleFactor: parseFloat(scaleFactor) || 1,        // 1 = full scale, 0.01 = 1%
+        // Liquidity config with defaults - bot auto-calculates order sizes
         minDepth2Percent: parseFloat(minDepth2Percent) || 500,
         minDepthTop20: parseFloat(minDepthTop20) || 1000,
         minOrderCount: parseInt(minOrderCount) || 30,
         maxSpread: parseFloat(maxSpread) || 1,
         maxOrderGap: parseFloat(maxOrderGap) || 1,
-        orderSizeUsdt: parseFloat(orderSizeUsdt) || 20,
         checkIntervalSeconds: parseInt(checkIntervalSeconds) || 30,
         autoManage: autoManage || false,
         telegramEnabled: telegramEnabled || false,
@@ -105,6 +102,26 @@ export function setupXtLiquidityBotRoutes(app, db) {
         .find({ mexcUserId: req.xtUser.id })
         .sort({ createdAt: -1 })
         .toArray();
+      
+      // Fetch fresh balance for each bot to show real-time data
+      const credentials = await getXtUserCredentials(db, req.xtUser.id);
+      if (credentials && xtLiquidityBotMonitorRef) {
+        try {
+          const freshBalance = await xtLiquidityBotMonitorRef.getAccountBalance(credentials.apiKey, credentials.apiSecret);
+          if (freshBalance) {
+            // Update all bots with fresh balance data
+            bots.forEach(bot => {
+              bot.availableBalance = {
+                usdt: freshBalance.usdt?.availableAmount || 0,
+                gcb: freshBalance.gcb?.availableAmount || 0
+              };
+            });
+          }
+        } catch (err) {
+          console.error('Error fetching fresh balance for bot list:', err);
+        }
+      }
+      
       res.json({ code: '0', msg: 'Success', data: bots });
     } catch (error) {
       console.error('Error fetching XT liquidity bots:', error);
@@ -360,7 +377,23 @@ export function setupXtLiquidityBotRoutes(app, db) {
       
       const result = await db.collection('xt_liquidity_bots').updateOne(
         { _id: new ObjectId(botId), mexcUserId: req.xtUser.id },
-        { $set: { isRunning: false, updatedAt: new Date() } }
+        { 
+          $set: { 
+            isRunning: false, 
+            updatedAt: new Date(),
+            // Reset metrics when bot stops
+            lastMidPrice: 0,
+            lastSpread: 0,
+            lastBuyDepth: 0,
+            lastSellDepth: 0,
+            lastBuyOrderCount: 0,
+            lastSellOrderCount: 0,
+            liquidityOk: false,
+            budgetRequired: { buy: 0, sell: 0, total: 0 },
+            myBuyOrderCount: 0,
+            mySellOrderCount: 0
+          } 
+        }
       );
 
       if (result.matchedCount === 0) {
