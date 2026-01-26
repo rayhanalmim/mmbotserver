@@ -21,6 +21,8 @@ import { setupXtUserApiRoutes, setXtUserBotMonitor } from './xt-user-api-routes.
 import XtUserBotMonitor from './xt-user-bot-monitor.js';
 import { setupXtLiquidityBotRoutes, setXtLiquidityBotMonitor } from './xt-liquidity-bot-routes.js';
 import XtLiquidityBotMonitor from './xt-liquidity-bot-monitor.js';
+import { setupXtSellLiquidityBotRoutes, setXtSellLiquidityBotMonitor } from './xt-sell-liquidity-bot-routes.js';
+import XtSellLiquidityBotMonitor from './xt-sell-liquidity-bot-monitor.js';
 import { setupInstallmentRoutes } from './installment-routes.js';
 import { setupInstallmentQueueRoutes } from './installment-queue-routes.js';
 import { createQueueWorker } from './installment-queue-worker.js';
@@ -63,6 +65,7 @@ let mexcMMBotMonitor;
 let mexcUserBotMonitor;
 let xtUserBotMonitor;
 let xtLiquidityBotMonitor;
+let xtSellLiquidityBotMonitor;
 
 // Connect to MongoDB
 async function connectToMongoDB() {
@@ -4140,6 +4143,17 @@ connectToMongoDB().then(async () => {
     console.error('⚠️ Error starting XT Liquidity Bot Monitor:', error.message);
   }
 
+  // Initialize XT Sell-Side Liquidity Bot Routes and Monitor
+  setupXtSellLiquidityBotRoutes(app, db);
+  xtSellLiquidityBotMonitor = new XtSellLiquidityBotMonitor(db);
+  setXtSellLiquidityBotMonitor(xtSellLiquidityBotMonitor);
+  try {
+    await xtSellLiquidityBotMonitor.start();
+    console.log('✅ XT Sell Liquidity Bot Monitor started');
+  } catch (error) {
+    console.error('⚠️ Error starting XT Sell Liquidity Bot Monitor:', error.message);
+  }
+
   // Initialize Installment Routes
   setupInstallmentRoutes(app, db, verifyMexcToken);
   console.log('✅ Installment routes initialized');
@@ -4376,6 +4390,10 @@ process.on('SIGINT', async () => {
   if (xtLiquidityBotMonitor && xtLiquidityBotMonitor.isRunning) {
     await xtLiquidityBotMonitor.stop();
     console.log('✅ XT Liquidity bot monitor stopped');
+  }
+  if (xtSellLiquidityBotMonitor && xtSellLiquidityBotMonitor.isRunning) {
+    await xtSellLiquidityBotMonitor.stop();
+    console.log('✅ XT Sell Liquidity bot monitor stopped');
   }
   if (client) {
     await client.close();
