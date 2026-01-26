@@ -585,6 +585,10 @@ class XtLiquidityBotMonitor {
   /**
    * Generate orders needed to fulfill liquidity requirements
    * Properly calculates depth needed and places orders to meet targets
+   * 
+   * Order count optimization:
+   * - If market already has 10+ orders on BOTH sides, we only need 20 orders per side
+   * - Otherwise, we need full 30 orders per side
    */
   generateNeededOrders(analysis, config, symbolInfo, myBuyOrders = [], mySellOrders = []) {
     const orders = { buys: [], sells: [] };
@@ -596,7 +600,7 @@ class XtLiquidityBotMonitor {
     
     // Config values
     const targetDepth2Pct = config.minDepth2Percent || 500;  // Target depth within ±2%
-    const minOrderCount = config.minOrderCount || 30;
+    const configMinOrderCount = config.minOrderCount || 30;
     
     // Helper functions
     const formatPrice = (price) => parseFloat(price.toFixed(pricePrecision));
@@ -612,6 +616,36 @@ class XtLiquidityBotMonitor {
     // Current total market depth (includes ALL orders)
     const totalBuyDepth = analysis.metrics?.buyDepth2Pct || 0;
     const totalSellDepth = analysis.metrics?.sellDepth2Pct || 0;
+    
+    // Get market order counts from analysis (total orders in orderbook)
+    const marketBuyOrderCount = analysis.metrics?.buyOrderCount || 0;
+    const marketSellOrderCount = analysis.metrics?.sellOrderCount || 0;
+    
+    // ===== DYNAMIC ORDER COUNT OPTIMIZATION =====
+    // If market already has 10+ orders on BOTH sides, we only need 20 orders per side
+    // This reduces our order quantity while still meeting the 30 total requirement
+    const marketHasEnoughBuys = marketBuyOrderCount >= 10;
+    const marketHasEnoughSells = marketSellOrderCount >= 10;
+    
+    let targetBuyOrderCount = configMinOrderCount;
+    let targetSellOrderCount = configMinOrderCount;
+    
+    if (marketHasEnoughBuys && marketHasEnoughSells) {
+      // Market already has 10+ orders on both sides, we only need 20 each
+      targetBuyOrderCount = Math.min(20, configMinOrderCount);
+      targetSellOrderCount = Math.min(20, configMinOrderCount);
+      this.log('info', `📊 Market has ${marketBuyOrderCount}B/${marketSellOrderCount}S orders - reducing target to 20 per side`);
+    } else {
+      // Check each side individually
+      if (marketHasEnoughBuys) {
+        targetBuyOrderCount = Math.min(20, configMinOrderCount);
+        this.log('info', `📊 Market has ${marketBuyOrderCount} buy orders - reducing buy target to 20`);
+      }
+      if (marketHasEnoughSells) {
+        targetSellOrderCount = Math.min(20, configMinOrderCount);
+        this.log('info', `📊 Market has ${marketSellOrderCount} sell orders - reducing sell target to 20`);
+      }
+    }
     
     // Calculate OUR current depth contribution in ±2% zone
     const criticalBuyZoneMin = midPrice * 0.98;
@@ -645,11 +679,11 @@ class XtLiquidityBotMonitor {
     const neededBuyDepth = Math.max(0, targetDepth2Pct - myBuyDepth);
     const neededSellDepth = Math.max(0, targetDepth2Pct - mySellDepth);
     
-    // Calculate how many MORE orders we need
+    // Calculate how many MORE orders we need (using dynamic target)
     const existingBuyCount = myBuyPrices.length;
     const existingSellCount = mySellPrices.length;
-    const neededBuyOrders = Math.max(0, minOrderCount - existingBuyCount);
-    const neededSellOrders = Math.max(0, minOrderCount - existingSellCount);
+    const neededBuyOrders = Math.max(0, targetBuyOrderCount - existingBuyCount);
+    const neededSellOrders = Math.max(0, targetSellOrderCount - existingSellCount);
 
     // Calculate minimum budget required
     const minBudgetNeeded = {
@@ -660,15 +694,15 @@ class XtLiquidityBotMonitor {
 
     this.log('info', `📊 Total Market: Buy $${totalBuyDepth.toFixed(2)}, Sell $${totalSellDepth.toFixed(2)}`);
     this.log('info', `📊 My Depth: Buy $${myBuyDepth.toFixed(2)}/${targetDepth2Pct}, Sell $${mySellDepth.toFixed(2)}/${targetDepth2Pct}`);
-    this.log('info', `📊 Orders: Have ${existingBuyCount}B/${existingSellCount}S, Need ${neededBuyOrders}B/${neededSellOrders}S more`);
+    this.log('info', `📊 Orders: Have ${existingBuyCount}B/${existingSellCount}S, Target ${targetBuyOrderCount}B/${targetSellOrderCount}S, Need ${neededBuyOrders}B/${neededSellOrders}S more`);
     this.log('info', `💰 Need to add: $${neededBuyDepth.toFixed(2)} USDT for buys, $${neededSellDepth.toFixed(2)} USDT for sells`);
 
     // ===== GENERATE BUY ORDERS =====
     if (neededBuyOrders > 0 || neededBuyDepth > 0) {
       // Priority 1: Fill ±2% zone first for depth requirement
-      // Maintain minimum 0.5% spread - don't place orders closer than 0.5% from mid
+      // Maintain ~0.4% spread from mid for total spread of ~0.8% (below 1% requirement)
       const criticalZoneMin = midPrice * 0.98;
-      const criticalZoneMax = midPrice * 0.995; // 0.5% below mid-price
+      const criticalZoneMax = midPrice * 0.996; // 0.4% below mid-price
       
       // Calculate price levels in critical zone
       const priceStep = (criticalZoneMax - criticalZoneMin) / Math.max(neededBuyOrders, 10);
@@ -729,8 +763,8 @@ class XtLiquidityBotMonitor {
     // ===== GENERATE SELL ORDERS =====
     if (neededSellOrders > 0 || neededSellDepth > 0) {
       // Priority 1: Fill ±2% zone first for depth requirement
-      // Maintain minimum 0.5% spread - don't place orders closer than 0.5% from mid
-      const criticalZoneMin = midPrice * 1.005; // 0.5% above mid-price
+      // Maintain ~0.4% spread from mid for total spread of ~0.8% (below 1% requirement)
+      const criticalZoneMin = midPrice * 1.004; // 0.4% above mid-price
       const criticalZoneMax = midPrice * 1.02;
       
       // Calculate price levels in critical zone
