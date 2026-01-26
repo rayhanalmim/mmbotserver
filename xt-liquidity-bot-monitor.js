@@ -526,6 +526,9 @@ class XtLiquidityBotMonitor {
       const calculatedMid = (bestBid + bestAsk) / 2;
       analysis.metrics.spread = ((bestAsk - bestBid) / calculatedMid) * 100;
       analysis.metrics.spreadOk = analysis.metrics.spread < maxSpread;
+      // Store best bid/ask for spread tightening logic
+      analysis.metrics.bestBid = bestBid;
+      analysis.metrics.bestAsk = bestAsk;
     }
 
     // 2. Calculate depth within ±2% of mid-price
@@ -1070,19 +1073,19 @@ class XtLiquidityBotMonitor {
                     analysis.metrics.buyGapsOk &&
                     analysis.metrics.sellGapsOk;
 
-      // Get MY open orders first for accurate budget calculation
-      const myOpenOrdersForCalc = await this.getOpenOrders(credentials.apiKey, credentials.apiSecret, symbol);
-      const myBuyOrdersForCalc = myOpenOrdersForCalc.filter(o => o.side?.toUpperCase() === 'BUY');
-      const mySellOrdersForCalc = myOpenOrdersForCalc.filter(o => o.side?.toUpperCase() === 'SELL');
+      // Get MY open orders ONCE for all calculations
+      const myOpenOrders = await this.getOpenOrders(credentials.apiKey, credentials.apiSecret, symbol);
+      const myBuyOrders = myOpenOrders.filter(o => o.side?.toUpperCase() === 'BUY');
+      const mySellOrders = myOpenOrders.filter(o => o.side?.toUpperCase() === 'SELL');
       
-      // Calculate budget requirements for UI - pass full order objects
-      const tempNeededOrders = this.generateNeededOrders(analysis, freshBot, symbolInfo, myBuyOrdersForCalc, mySellOrdersForCalc);
+      // Calculate budget requirements for UI
+      const tempNeededOrders = this.generateNeededOrders(analysis, freshBot, symbolInfo, myBuyOrders, mySellOrders);
       const budgetRequired = tempNeededOrders.budgetRequired || { buy: 0, sell: 0, total: 0 };
       
       // Get balance for status update
       const balancesForStatus = await this.getAccountBalance(credentials.apiKey, credentials.apiSecret);
       
-      // Update bot status with budget info
+      // Update bot status IMMEDIATELY with fresh market data (reduces UI latency)
       await this.db.collection('xt_liquidity_bots').updateOne(
         { _id: bot._id },
         { 
@@ -1100,21 +1103,11 @@ class XtLiquidityBotMonitor {
               usdt: balancesForStatus?.usdt?.availableAmount || 0, 
               gcb: balancesForStatus?.gcb?.availableAmount || 0 
             },
-            myBuyOrderCount: myBuyOrdersForCalc.length,
-            mySellOrderCount: mySellOrdersForCalc.length,
+            myBuyOrderCount: myBuyOrders.length,
+            mySellOrderCount: mySellOrders.length,
             updatedAt: new Date()
           } 
         }
-      );
-
-      // Fetch MY open orders to update counts in DB
-      const myOrdersForCount = await this.getOpenOrders(credentials.apiKey, credentials.apiSecret, symbol);
-      const myBuys = myOrdersForCount.filter(o => o.side?.toUpperCase() === 'BUY').length;
-      const mySells = myOrdersForCount.filter(o => o.side?.toUpperCase() === 'SELL').length;
-      
-      await this.db.collection('xt_liquidity_bots').updateOne(
-        { _id: bot._id },
-        { $set: { myBuyOrderCount: myBuys, mySellOrderCount: mySells } }
       );
 
       // Only place orders if autoManage is enabled
@@ -1136,12 +1129,6 @@ class XtLiquidityBotMonitor {
         return;
       }
 
-      // Get MY open orders to check if we need to place more
-      const myOpenOrders = await this.getOpenOrders(credentials.apiKey, credentials.apiSecret, symbol);
-      // XT API returns side in uppercase, but check both just in case
-      const myBuyOrders = myOpenOrders.filter(o => o.side?.toUpperCase() === 'BUY');
-      const mySellOrders = myOpenOrders.filter(o => o.side?.toUpperCase() === 'SELL');
-      
       this.log('info', `[${bot.name}] 🔍 Found ${myOpenOrders.length} total open orders (${myBuyOrders.length}B/${mySellOrders.length}S)`);
       
       const minOrderCount = freshBot.minOrderCount || 30;
@@ -1182,10 +1169,16 @@ class XtLiquidityBotMonitor {
 
       // Check if MARKET already meets requirements (not just our orders)
       const targetDepth2Pct = freshBot.minDepth2Percent || 500;
+      const targetDepthTop20 = freshBot.minDepthTop20 || 1000;
       const marketBuyDepthOk = analysis.metrics.buyDepth2Pct >= targetDepth2Pct;
       const marketSellDepthOk = analysis.metrics.sellDepth2Pct >= targetDepth2Pct;
+      const marketBuyDepthTop20Ok = analysis.metrics.buyDepthTop20 >= targetDepthTop20;
+      const marketSellDepthTop20Ok = analysis.metrics.sellDepthTop20 >= targetDepthTop20;
       const marketBuyCountOk = analysis.metrics.buyOrderCount >= minOrderCount;
       const marketSellCountOk = analysis.metrics.sellOrderCount >= minOrderCount;
+      const spreadOk = analysis.metrics.spreadOk;
+      const buyGapsOk = analysis.metrics.buyGapsOk;
+      const sellGapsOk = analysis.metrics.sellGapsOk;
       
       // If MARKET already meets all requirements, don't place any orders
       if (allOk) {
@@ -1193,9 +1186,99 @@ class XtLiquidityBotMonitor {
         return;
       }
       
-      // Check which side needs help
-      const needMoreBuys = !marketBuyDepthOk || !marketBuyCountOk;
-      const needMoreSells = !marketSellDepthOk || !marketSellCountOk;
+      // Log what requirements are failing
+      if (!spreadOk) {
+        this.log('warning', `[${bot.name}] ⚠️ Spread ${analysis.metrics.spread.toFixed(3)}% exceeds target ${freshBot.maxSpread || 1}% - will place orders to tighten`);
+      }
+      if (!buyGapsOk) {
+        this.log('warning', `[${bot.name}] ⚠️ Buy side has price gaps > ${freshBot.maxOrderGap || 1}% - will place orders to fill`);
+      }
+      if (!sellGapsOk) {
+        this.log('warning', `[${bot.name}] ⚠️ Sell side has price gaps > ${freshBot.maxOrderGap || 1}% - will place orders to fill`);
+      }
+      if (!marketBuyDepthTop20Ok) {
+        this.log('warning', `[${bot.name}] ⚠️ Buy top20 depth $${analysis.metrics.buyDepthTop20.toFixed(2)} below target $${targetDepthTop20}`);
+      }
+      if (!marketSellDepthTop20Ok) {
+        this.log('warning', `[${bot.name}] ⚠️ Sell top20 depth $${analysis.metrics.sellDepthTop20.toFixed(2)} below target $${targetDepthTop20}`);
+      }
+      
+      // SPREAD TIGHTENING: If spread is broken but we already have max orders,
+      // we need to cancel far orders and place closer ones
+      const dynamicTarget = (analysis.metrics.buyOrderCount >= 10 && analysis.metrics.sellOrderCount >= 10) ? 20 : (freshBot.minOrderCount || 30);
+      const haveMaxBuys = updatedBuyOrders.length >= dynamicTarget;
+      const haveMaxSells = updatedSellOrders.length >= dynamicTarget;
+      
+      if (!spreadOk && (haveMaxBuys || haveMaxSells)) {
+        this.log('info', `[${bot.name}] 🔄 Spread broken with max orders - need to reposition orders closer to mid-price`);
+        
+        // Find the best bid and ask to understand where we need orders
+        const bestBid = analysis.metrics.bestBid || midPrice * 0.996;
+        const bestAsk = analysis.metrics.bestAsk || midPrice * 1.004;
+        const targetSpread = (freshBot.maxSpread || 1) / 100; // e.g., 0.01 for 1%
+        
+        // To fix spread, we need:
+        // - Buy orders closer to bestAsk (higher buy prices)
+        // - Sell orders closer to bestBid (lower sell prices)
+        const targetBuyPrice = midPrice * (1 - targetSpread / 2); // e.g., 0.4% below mid
+        const targetSellPrice = midPrice * (1 + targetSpread / 2); // e.g., 0.4% above mid
+        
+        // Find our orders that are too far from where they should be
+        const ordersToRepositionBuy = [];
+        const ordersToRepositionSell = [];
+        
+        if (haveMaxBuys && !spreadOk) {
+          // Sort buy orders by price (ascending - lowest first)
+          const sortedBuys = [...updatedBuyOrders].sort((a, b) => parseFloat(a.price) - parseFloat(b.price));
+          // Cancel up to 3 of the lowest (farthest from mid) buy orders
+          for (let i = 0; i < Math.min(3, sortedBuys.length); i++) {
+            const order = sortedBuys[i];
+            const orderPrice = parseFloat(order.price);
+            // Only cancel if it's more than 1% below target buy price
+            if (orderPrice < targetBuyPrice * 0.99) {
+              ordersToRepositionBuy.push(order.orderId);
+            }
+          }
+        }
+        
+        if (haveMaxSells && !spreadOk) {
+          // Sort sell orders by price (descending - highest first)
+          const sortedSells = [...updatedSellOrders].sort((a, b) => parseFloat(b.price) - parseFloat(a.price));
+          // Cancel up to 3 of the highest (farthest from mid) sell orders
+          for (let i = 0; i < Math.min(3, sortedSells.length); i++) {
+            const order = sortedSells[i];
+            const orderPrice = parseFloat(order.price);
+            // Only cancel if it's more than 1% above target sell price
+            if (orderPrice > targetSellPrice * 1.01) {
+              ordersToRepositionSell.push(order.orderId);
+            }
+          }
+        }
+        
+        const totalToReposition = ordersToRepositionBuy.length + ordersToRepositionSell.length;
+        if (totalToReposition > 0) {
+          this.log('info', `[${bot.name}] 🔄 Cancelling ${ordersToRepositionBuy.length} far buy orders and ${ordersToRepositionSell.length} far sell orders to reposition`);
+          const allToCancel = [...ordersToRepositionBuy, ...ordersToRepositionSell];
+          await this.cancelBatchOrders(credentials.apiKey, credentials.apiSecret, allToCancel);
+          await new Promise(resolve => setTimeout(resolve, 500));
+          
+          // Update our order lists after cancellation
+          const refreshedOrders = await this.getOpenOrders(credentials.apiKey, credentials.apiSecret, symbol);
+          updatedBuyOrders.length = 0;
+          updatedSellOrders.length = 0;
+          refreshedOrders.forEach(o => {
+            if (o.side?.toUpperCase() === 'BUY') updatedBuyOrders.push(o);
+            else if (o.side?.toUpperCase() === 'SELL') updatedSellOrders.push(o);
+          });
+          
+          this.log('info', `[${bot.name}] 📋 After repositioning cancel: ${updatedBuyOrders.length}B/${updatedSellOrders.length}S orders`);
+        }
+      }
+      
+      // Check which side needs help - include ALL requirement checks!
+      // When any requirement is broken, we need orders to fix it
+      const needMoreBuys = !marketBuyDepthOk || !marketBuyCountOk || !spreadOk || !buyGapsOk || !marketBuyDepthTop20Ok;
+      const needMoreSells = !marketSellDepthOk || !marketSellCountOk || !spreadOk || !sellGapsOk || !marketSellDepthTop20Ok;
       
       // Log what needs improvement
       if (needMoreBuys) {
@@ -1219,12 +1302,13 @@ class XtLiquidityBotMonitor {
       this.log('info', `[${bot.name}] 📋 Existing orders - Buy: ${updatedBuyOrders.length}, Sell: ${updatedSellOrders.length}`);
       const neededOrders = this.generateNeededOrders(analysis, freshBot, symbolInfo, updatedBuyOrders, updatedSellOrders);
       
-      // Filter out orders for sides that already meet requirements
-      if (marketBuyDepthOk && marketBuyCountOk) {
+      // Filter out orders for sides that already meet ALL requirements
+      // Only skip if depth, count, spread, gaps, AND top20 depth are all OK
+      if (marketBuyDepthOk && marketBuyCountOk && spreadOk && buyGapsOk && marketBuyDepthTop20Ok) {
         this.log('info', `[${bot.name}] ✅ Buy side already sufficient - skipping buy orders`);
         neededOrders.buys = [];
       }
-      if (marketSellDepthOk && marketSellCountOk) {
+      if (marketSellDepthOk && marketSellCountOk && spreadOk && sellGapsOk && marketSellDepthTop20Ok) {
         this.log('info', `[${bot.name}] ✅ Sell side already sufficient - skipping sell orders`);
         neededOrders.sells = [];
       }
