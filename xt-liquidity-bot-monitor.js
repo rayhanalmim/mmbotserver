@@ -603,6 +603,7 @@ class XtLiquidityBotMonitor {
     
     // Config values
     const targetDepth2Pct = config.minDepth2Percent || 500;  // Target depth within ±2%
+    const targetDepthTop20 = config.minDepthTop20 || 1000;   // Target Top 20 cumulative depth
     const configMinOrderCount = config.minOrderCount || 30;
     
     // Helper functions
@@ -677,10 +678,32 @@ class XtLiquidityBotMonitor {
         return sum + (price * qty);
       }, 0);
     
-    // Calculate how much MORE depth WE need to add to reach target
-    // Target is what WE should contribute, not total market
-    const neededBuyDepth = Math.max(0, targetDepth2Pct - myBuyDepth);
-    const neededSellDepth = Math.max(0, targetDepth2Pct - mySellDepth);
+    // Calculate Top 20 depth from our orders (sort by price and take top 20)
+    const sortedBuyOrders = [...myBuyOrders].sort((a, b) => parseFloat(b.price) - parseFloat(a.price)).slice(0, 20);
+    const sortedSellOrders = [...mySellOrders].sort((a, b) => parseFloat(a.price) - parseFloat(b.price)).slice(0, 20);
+    
+    const myBuyDepthTop20 = sortedBuyOrders.reduce((sum, o) => {
+      const price = parseFloat(o.price || 0);
+      const qty = parseFloat(o.origQty || 0);
+      return sum + (price * qty);
+    }, 0);
+    
+    const mySellDepthTop20 = sortedSellOrders.reduce((sum, o) => {
+      const price = parseFloat(o.price || 0);
+      const qty = parseFloat(o.origQty || 0);
+      return sum + (price * qty);
+    }, 0);
+    
+    // Calculate how much MORE depth WE need to add to reach BOTH targets
+    // Use the MAX of ±2% depth needed and Top 20 depth needed
+    const neededBuyDepth2Pct = Math.max(0, targetDepth2Pct - myBuyDepth);
+    const neededSellDepth2Pct = Math.max(0, targetDepth2Pct - mySellDepth);
+    const neededBuyDepthTop20 = Math.max(0, targetDepthTop20 - myBuyDepthTop20);
+    const neededSellDepthTop20 = Math.max(0, targetDepthTop20 - mySellDepthTop20);
+    
+    // Use the HIGHER of the two requirements to ensure BOTH are met
+    const neededBuyDepth = Math.max(neededBuyDepth2Pct, neededBuyDepthTop20);
+    const neededSellDepth = Math.max(neededSellDepth2Pct, neededSellDepthTop20);
     
     // Calculate how many MORE orders we need (using dynamic target)
     const existingBuyCount = myBuyPrices.length;
@@ -696,66 +719,73 @@ class XtLiquidityBotMonitor {
     };
 
     this.log('info', `📊 Total Market: Buy $${totalBuyDepth.toFixed(2)}, Sell $${totalSellDepth.toFixed(2)}`);
-    this.log('info', `📊 My Depth: Buy $${myBuyDepth.toFixed(2)}/${targetDepth2Pct}, Sell $${mySellDepth.toFixed(2)}/${targetDepth2Pct}`);
+    this.log('info', `📊 My ±2% Depth: Buy $${myBuyDepth.toFixed(2)}/${targetDepth2Pct}, Sell $${mySellDepth.toFixed(2)}/${targetDepth2Pct}`);
+    this.log('info', `📊 My Top20 Depth: Buy $${myBuyDepthTop20.toFixed(2)}/${targetDepthTop20}, Sell $${mySellDepthTop20.toFixed(2)}/${targetDepthTop20}`);
     this.log('info', `📊 Orders: Have ${existingBuyCount}B/${existingSellCount}S, Target ${targetBuyOrderCount}B/${targetSellOrderCount}S, Need ${neededBuyOrders}B/${neededSellOrders}S more`);
     this.log('info', `💰 Need to add: $${neededBuyDepth.toFixed(2)} USDT for buys, $${neededSellDepth.toFixed(2)} USDT for sells`);
 
     // ===== GENERATE BUY ORDERS =====
+    // Split budget: $500 in ±2% zone (top 10 orders), $500 outside zone (next 10 orders)
     if (neededBuyOrders > 0 || neededBuyDepth > 0) {
-      // Priority 1: Fill ±2% zone first for depth requirement
-      // Maintain ~0.4% spread from mid for total spread of ~0.8% (below 1% requirement)
       const criticalZoneMin = midPrice * 0.98;
       const criticalZoneMax = midPrice * 0.996; // 0.4% below mid-price
       
-      // Calculate price levels in critical zone
-      const priceStep = (criticalZoneMax - criticalZoneMin) / Math.max(neededBuyOrders, 10);
-      const buyPriceLevels = [];
-      
-      // Start from highest price (closest to mid) and work down
+      // Zone 1: ±2% zone (10 orders with $500 depth)
+      const zone1Orders = [];
+      const zone1PriceStep = (criticalZoneMax - criticalZoneMin) / 10;
       let currentPrice = criticalZoneMax;
-      while (buyPriceLevels.length < neededBuyOrders && currentPrice >= criticalZoneMin) {
+      
+      for (let i = 0; i < 10 && currentPrice >= criticalZoneMin; i++) {
         const price = formatPrice(currentPrice);
         const priceStr = price.toString();
         if (!existingBuyPrices.has(priceStr) && price < midPrice) {
-          buyPriceLevels.push(price);
+          zone1Orders.push(price);
           existingBuyPrices.add(priceStr);
         }
-        currentPrice -= priceStep;
+        currentPrice -= zone1PriceStep;
       }
       
-      // If we need more orders, extend beyond ±2% zone
-      if (buyPriceLevels.length < neededBuyOrders) {
-        currentPrice = criticalZoneMin - 0.0001;
-        const extendedMin = midPrice * 0.90;
-        while (buyPriceLevels.length < neededBuyOrders && currentPrice >= extendedMin) {
-          const price = formatPrice(currentPrice);
-          const priceStr = price.toString();
-          if (!existingBuyPrices.has(priceStr)) {
-            buyPriceLevels.push(price);
-            existingBuyPrices.add(priceStr);
-          }
-          currentPrice *= 0.995; // Step down by 0.5%
+      // Zone 2: Outside ±2% zone (10 orders with $500 depth)
+      const zone2Orders = [];
+      currentPrice = criticalZoneMin - 0.0001;
+      const extendedMin = midPrice * 0.90;
+      
+      while (zone2Orders.length < 10 && currentPrice >= extendedMin) {
+        const price = formatPrice(currentPrice);
+        const priceStr = price.toString();
+        if (!existingBuyPrices.has(priceStr)) {
+          zone2Orders.push(price);
+          existingBuyPrices.add(priceStr);
         }
+        currentPrice *= 0.995; // Step down by 0.5%
       }
       
-      // Distribute the needed depth across orders
-      // 80% of depth in first 20% of orders (closest to mid)
-      // 20% of depth in remaining 80% of orders
-      if (buyPriceLevels.length > 0) {
-        const totalDepthToPlace = neededBuyDepth > 0 ? neededBuyDepth : Math.min(targetDepth2Pct * 0.5, 50);
-        const criticalOrderCount = Math.ceil(buyPriceLevels.length * 0.2);
+      // Distribute $500 across Zone 1 orders with RANDOM amounts (±2% zone for requirement 2)
+      const zone1Depth = targetDepth2Pct; // $500 for ±2% requirement
+      if (zone1Orders.length > 0) {
+        // Generate random weights for each order
+        const zone1Weights = zone1Orders.map(() => 0.5 + Math.random()); // Random between 0.5 and 1.5
+        const zone1TotalWeight = zone1Weights.reduce((a, b) => a + b, 0);
         
-        buyPriceLevels.forEach((price, idx) => {
-          let orderValue;
-          if (idx < criticalOrderCount) {
-            // Critical orders get 80% of depth
-            orderValue = (totalDepthToPlace * 0.8) / criticalOrderCount;
-          } else {
-            // Remaining orders share 20% of depth
-            orderValue = (totalDepthToPlace * 0.2) / Math.max(1, buyPriceLevels.length - criticalOrderCount);
+        zone1Orders.forEach((price, idx) => {
+          const orderDepth = (zone1Weights[idx] / zone1TotalWeight) * zone1Depth;
+          const qty = formatQty(orderDepth / price);
+          if (qty >= 0.01) {
+            orders.buys.push({ price: price.toString(), quantity: qty.toString() });
           }
-          
-          const qty = formatQty(orderValue / price);
+        });
+      }
+      
+      // Distribute $500 across Zone 2 orders with RANDOM amounts (outside zone for Top 20 requirement)
+      const zone2Depth = targetDepthTop20 - targetDepth2Pct; // Remaining $500 for Top 20
+      if (zone2Orders.length > 0 && zone2Depth > 0) {
+        // Generate random weights for each order
+        const zone2Weights = zone2Orders.map(() => 0.5 + Math.random()); // Random between 0.5 and 1.5
+        const zone2TotalWeight = zone2Weights.reduce((a, b) => a + b, 0);
+        
+        zone2Orders.forEach((price, idx) => {
+          const orderDepth = (zone2Weights[idx] / zone2TotalWeight) * zone2Depth;
+          const qty = formatQty(orderDepth / price);
           if (qty >= 0.01) {
             orders.buys.push({ price: price.toString(), quantity: qty.toString() });
           }
@@ -764,59 +794,67 @@ class XtLiquidityBotMonitor {
     }
 
     // ===== GENERATE SELL ORDERS =====
+    // Split budget: $500 in ±2% zone (top 10 orders), $500 outside zone (next 10 orders)
     if (neededSellOrders > 0 || neededSellDepth > 0) {
-      // Priority 1: Fill ±2% zone first for depth requirement
-      // Maintain ~0.4% spread from mid for total spread of ~0.8% (below 1% requirement)
       const criticalZoneMin = midPrice * 1.004; // 0.4% above mid-price
       const criticalZoneMax = midPrice * 1.02;
       
-      // Calculate price levels in critical zone
-      const priceStep = (criticalZoneMax - criticalZoneMin) / Math.max(neededSellOrders, 10);
-      const sellPriceLevels = [];
-      
-      // Start from lowest price (closest to mid) and work up
+      // Zone 1: ±2% zone (10 orders with $500 depth)
+      const zone1Orders = [];
+      const zone1PriceStep = (criticalZoneMax - criticalZoneMin) / 10;
       let currentPrice = criticalZoneMin;
-      while (sellPriceLevels.length < neededSellOrders && currentPrice <= criticalZoneMax) {
+      
+      for (let i = 0; i < 10 && currentPrice <= criticalZoneMax; i++) {
         const price = formatPrice(currentPrice);
         const priceStr = price.toString();
         if (!existingSellPrices.has(priceStr) && price > midPrice) {
-          sellPriceLevels.push(price);
+          zone1Orders.push(price);
           existingSellPrices.add(priceStr);
         }
-        currentPrice += priceStep;
+        currentPrice += zone1PriceStep;
       }
       
-      // If we need more orders, extend beyond ±2% zone
-      if (sellPriceLevels.length < neededSellOrders) {
-        currentPrice = criticalZoneMax + 0.0001;
-        const extendedMax = midPrice * 1.10;
-        while (sellPriceLevels.length < neededSellOrders && currentPrice <= extendedMax) {
-          const price = formatPrice(currentPrice);
-          const priceStr = price.toString();
-          if (!existingSellPrices.has(priceStr)) {
-            sellPriceLevels.push(price);
-            existingSellPrices.add(priceStr);
-          }
-          currentPrice *= 1.005; // Step up by 0.5%
+      // Zone 2: Outside ±2% zone (10 orders with $500 depth)
+      const zone2Orders = [];
+      currentPrice = criticalZoneMax + 0.0001;
+      const extendedMax = midPrice * 1.10;
+      
+      while (zone2Orders.length < 10 && currentPrice <= extendedMax) {
+        const price = formatPrice(currentPrice);
+        const priceStr = price.toString();
+        if (!existingSellPrices.has(priceStr)) {
+          zone2Orders.push(price);
+          existingSellPrices.add(priceStr);
         }
+        currentPrice *= 1.005; // Step up by 0.5%
       }
       
-      // Distribute the needed depth across orders
-      if (sellPriceLevels.length > 0) {
-        const totalDepthToPlace = neededSellDepth > 0 ? neededSellDepth : Math.min(targetDepth2Pct * 0.5, 50);
-        const criticalOrderCount = Math.ceil(sellPriceLevels.length * 0.2);
+      // Distribute $500 across Zone 1 orders with RANDOM amounts (±2% zone for requirement 2)
+      const zone1Depth = targetDepth2Pct; // $500 for ±2% requirement
+      if (zone1Orders.length > 0) {
+        // Generate random weights for each order
+        const zone1Weights = zone1Orders.map(() => 0.5 + Math.random()); // Random between 0.5 and 1.5
+        const zone1TotalWeight = zone1Weights.reduce((a, b) => a + b, 0);
         
-        sellPriceLevels.forEach((price, idx) => {
-          let orderValue;
-          if (idx < criticalOrderCount) {
-            // Critical orders get 80% of depth
-            orderValue = (totalDepthToPlace * 0.8) / criticalOrderCount;
-          } else {
-            // Remaining orders share 20% of depth
-            orderValue = (totalDepthToPlace * 0.2) / Math.max(1, sellPriceLevels.length - criticalOrderCount);
+        zone1Orders.forEach((price, idx) => {
+          const orderDepth = (zone1Weights[idx] / zone1TotalWeight) * zone1Depth;
+          const qty = formatQty(orderDepth / price);
+          if (qty >= 0.01) {
+            orders.sells.push({ price: price.toString(), quantity: qty.toString() });
           }
-          
-          const qty = formatQty(orderValue / price);
+        });
+      }
+      
+      // Distribute $500 across Zone 2 orders with RANDOM amounts (outside zone for Top 20 requirement)
+      const zone2Depth = targetDepthTop20 - targetDepth2Pct; // Remaining $500 for Top 20
+      if (zone2Orders.length > 0 && zone2Depth > 0) {
+        // Generate random weights for each order
+        const zone2Weights = zone2Orders.map(() => 0.5 + Math.random()); // Random between 0.5 and 1.5
+        const zone2TotalWeight = zone2Weights.reduce((a, b) => a + b, 0);
+        
+        zone2Orders.forEach((price, idx) => {
+          const orderDepth = (zone2Weights[idx] / zone2TotalWeight) * zone2Depth;
+          const qty = formatQty(orderDepth / price);
           if (qty >= 0.01) {
             orders.sells.push({ price: price.toString(), quantity: qty.toString() });
           }
@@ -1177,8 +1215,76 @@ class XtLiquidityBotMonitor {
       const marketBuyCountOk = analysis.metrics.buyOrderCount >= minOrderCount;
       const marketSellCountOk = analysis.metrics.sellOrderCount >= minOrderCount;
       const spreadOk = analysis.metrics.spreadOk;
-      const buyGapsOk = analysis.metrics.buyGapsOk;
-      const sellGapsOk = analysis.metrics.sellGapsOk;
+      
+      // For gaps, we only care about OUR orders meeting the gap requirement
+      // Check gaps in our top 20 orders, not the entire market
+      const myTop20Buys = [...updatedBuyOrders].sort((a, b) => parseFloat(b.price) - parseFloat(a.price)).slice(0, 20);
+      const myTop20Sells = [...updatedSellOrders].sort((a, b) => parseFloat(a.price) - parseFloat(b.price)).slice(0, 20);
+      
+      let myBuyGapsOk = true;
+      let mySellGapsOk = true;
+      const maxGap = freshBot.maxOrderGap || 1;
+      
+      // Only check gaps within our top 20 orders (not between order 20 and 21)
+      // If we have 20 orders, check 19 gaps (between orders 1-2, 2-3, ... 19-20)
+      if (myTop20Buys.length >= 2) {
+        const buyGapCount = myTop20Buys.length - 1; // Check all gaps within our orders
+        for (let i = 0; i < buyGapCount; i++) {
+          const gap = ((parseFloat(myTop20Buys[i].price) - parseFloat(myTop20Buys[i + 1].price)) / parseFloat(myTop20Buys[i].price)) * 100;
+          if (gap > maxGap) {
+            myBuyGapsOk = false;
+            break;
+          }
+        }
+      }
+      
+      // Only check gaps within our top 20 orders (not between order 20 and 21)
+      if (myTop20Sells.length >= 2) {
+        const sellGapCount = myTop20Sells.length - 1; // Check all gaps within our orders
+        for (let i = 0; i < sellGapCount; i++) {
+          const gap = ((parseFloat(myTop20Sells[i + 1].price) - parseFloat(myTop20Sells[i].price)) / parseFloat(myTop20Sells[i].price)) * 100;
+          if (gap > maxGap) {
+            mySellGapsOk = false;
+            break;
+          }
+        }
+      }
+      
+      // Use our gap checks, not market gap checks
+      const buyGapsOk = myBuyGapsOk;
+      const sellGapsOk = mySellGapsOk;
+      
+      // Calculate OUR depth contribution
+      const criticalBuyZoneMin = midPrice * 0.98;
+      const criticalSellZoneMax = midPrice * 1.02;
+      
+      const myBuyDepth2Pct = updatedBuyOrders
+        .filter(o => parseFloat(o.price) >= criticalBuyZoneMin && parseFloat(o.price) < midPrice)
+        .reduce((sum, o) => sum + parseFloat(o.price) * parseFloat(o.origQty || 0), 0);
+      
+      const mySellDepth2Pct = updatedSellOrders
+        .filter(o => parseFloat(o.price) > midPrice && parseFloat(o.price) <= criticalSellZoneMax)
+        .reduce((sum, o) => sum + parseFloat(o.price) * parseFloat(o.origQty || 0), 0);
+      
+      const myBuyDepthTop20 = myTop20Buys.reduce((sum, o) => sum + parseFloat(o.price) * parseFloat(o.origQty || 0), 0);
+      const mySellDepthTop20 = myTop20Sells.reduce((sum, o) => sum + parseFloat(o.price) * parseFloat(o.origQty || 0), 0);
+      
+      // Check if OUR orders meet requirements
+      const myBuyDepthOk = myBuyDepth2Pct >= targetDepth2Pct;
+      const mySellDepthOk = mySellDepth2Pct >= targetDepth2Pct;
+      const myBuyDepthTop20Ok = myBuyDepthTop20 >= targetDepthTop20;
+      const mySellDepthTop20Ok = mySellDepthTop20 >= targetDepthTop20;
+      const myBuyCountOk = updatedBuyOrders.length >= 20; // We target 20 orders
+      const mySellCountOk = updatedSellOrders.length >= 20;
+      
+      // All MY requirements met?
+      const myAllOk = spreadOk && myBuyDepthOk && mySellDepthOk && myBuyDepthTop20Ok && mySellDepthTop20Ok && myBuyCountOk && mySellCountOk && buyGapsOk && sellGapsOk;
+      
+      // If OUR orders already meet all requirements, don't place any more
+      if (myAllOk) {
+        this.log('success', `[${bot.name}] ✅ My orders already meet all requirements. Orders: ${updatedBuyOrders.length}B/${updatedSellOrders.length}S`);
+        return;
+      }
       
       // If MARKET already meets all requirements, don't place any orders
       if (allOk) {
@@ -1275,17 +1381,17 @@ class XtLiquidityBotMonitor {
         }
       }
       
-      // Check which side needs help - include ALL requirement checks!
-      // When any requirement is broken, we need orders to fix it
-      const needMoreBuys = !marketBuyDepthOk || !marketBuyCountOk || !spreadOk || !buyGapsOk || !marketBuyDepthTop20Ok;
-      const needMoreSells = !marketSellDepthOk || !marketSellCountOk || !spreadOk || !sellGapsOk || !marketSellDepthTop20Ok;
+      // Check which side needs help - use OUR order requirements, not market
+      // When any of OUR requirements is broken, we need orders to fix it
+      const needMoreBuys = !myBuyDepthOk || !myBuyCountOk || !spreadOk || !buyGapsOk || !myBuyDepthTop20Ok;
+      const needMoreSells = !mySellDepthOk || !mySellCountOk || !spreadOk || !sellGapsOk || !mySellDepthTop20Ok;
       
       // Log what needs improvement
       if (needMoreBuys) {
-        this.log('info', `[${bot.name}] 📋 Buy side needs help - Depth: $${analysis.metrics.buyDepth2Pct.toFixed(2)}/${targetDepth2Pct}, Count: ${analysis.metrics.buyOrderCount}/${minOrderCount}`);
+        this.log('info', `[${bot.name}] 📋 Buy side needs help - My Depth: $${myBuyDepth2Pct.toFixed(2)}/${targetDepth2Pct}, My Top20: $${myBuyDepthTop20.toFixed(2)}/${targetDepthTop20}, Count: ${updatedBuyOrders.length}/20`);
       }
       if (needMoreSells) {
-        this.log('info', `[${bot.name}] 📋 Sell side needs help - Depth: $${analysis.metrics.sellDepth2Pct.toFixed(2)}/${targetDepth2Pct}, Count: ${analysis.metrics.sellOrderCount}/${minOrderCount}`);
+        this.log('info', `[${bot.name}] 📋 Sell side needs help - My Depth: $${mySellDepth2Pct.toFixed(2)}/${targetDepth2Pct}, My Top20: $${mySellDepthTop20.toFixed(2)}/${targetDepthTop20}, Count: ${updatedSellOrders.length}/20`);
       }
 
       // Check balance before placing orders
@@ -1302,13 +1408,13 @@ class XtLiquidityBotMonitor {
       this.log('info', `[${bot.name}] 📋 Existing orders - Buy: ${updatedBuyOrders.length}, Sell: ${updatedSellOrders.length}`);
       const neededOrders = this.generateNeededOrders(analysis, freshBot, symbolInfo, updatedBuyOrders, updatedSellOrders);
       
-      // Filter out orders for sides that already meet ALL requirements
-      // Only skip if depth, count, spread, gaps, AND top20 depth are all OK
-      if (marketBuyDepthOk && marketBuyCountOk && spreadOk && buyGapsOk && marketBuyDepthTop20Ok) {
+      // Filter out orders for sides that already meet ALL OUR requirements
+      // Only skip if OUR depth, count, spread, gaps, AND top20 depth are all OK
+      if (myBuyDepthOk && myBuyCountOk && spreadOk && buyGapsOk && myBuyDepthTop20Ok) {
         this.log('info', `[${bot.name}] ✅ Buy side already sufficient - skipping buy orders`);
         neededOrders.buys = [];
       }
-      if (marketSellDepthOk && marketSellCountOk && spreadOk && sellGapsOk && marketSellDepthTop20Ok) {
+      if (mySellDepthOk && mySellCountOk && spreadOk && sellGapsOk && mySellDepthTop20Ok) {
         this.log('info', `[${bot.name}] ✅ Sell side already sufficient - skipping sell orders`);
         neededOrders.sells = [];
       }
@@ -1325,6 +1431,9 @@ class XtLiquidityBotMonitor {
       }
 
       // ALWAYS use available balance to improve depth, even if partial
+      // Helper function for formatting quantities (moved up to avoid reference error)
+      const formatQty = (qty) => Math.max(parseFloat(qty.toFixed(2)), 0.01);
+      
       if (neededOrders.buys.length > 0) {
         if (totalBuyUsdt > availableUsdt) {
           if (availableUsdt >= 0.5) { // At least $0.50 to place orders
@@ -1387,9 +1496,6 @@ class XtLiquidityBotMonitor {
           }
         }
       }
-      
-      // Helper function for formatting quantities
-      const formatQty = (qty) => Math.max(parseFloat(qty.toFixed(2)), 0.01);
 
       // Place orders in batches
       let ordersPlaced = 0;
